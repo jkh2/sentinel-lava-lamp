@@ -1,25 +1,20 @@
 # Sentinel Lava Lamp
 
-A listening lava lamp. Glowing, translucent wax drifts in a glass bottle while a song plays.
+A glass lava lamp you can watch, tune, and play music under.
+
+The wax is a set of glowing gobs inside a glass bottle. Smoke from a real footage plate drifts behind it. Drop in an mp3, or paste a YouTube link, and the coil follows the low end.
 
 **Try it:** https://sentinel-lava-lamp.vercel.app
 
-Drop in an mp3, wav, or m4a and the coil follows the low end. A YouTube link plays alongside. Hide the menus when you just want the glass.
+Amber, a cool coil, a still rise, large gobs, and a dim glow are the defaults.
 
-## Run it yourself
+## Run it locally
 
 ```bash
 npm install
 npm run dev
 ```
 
-Then open the page Vite prints.
+Then open http://127.0.0.1:8080
 
-## Tune
-
-- **Rise** — from a near-still drift to an eager climb
-- **Size** — beads up to fat globs
-- **Swirl** — how much each gob wanders on its own
-- **Coil, thickness, chill, glow, music drive** — heat, drag, cooling, light, and how hard the bass kicks
-
-Drag inside the glass to stir. Drip plants a new gob under the pointer.
+Smoke footage is [White smoke with black background](https://mixkit.co/free-stock-video/white-smoke-with-black-background-1960/) from Mixkit, used under the Mixkit Stock Video Free License.
