@@ -466,7 +466,7 @@ export class LampEngine {
     this.blit(this.velocity.write);
     this.velocity.swap();
     this.bind(0, this.dye.read.texture);
-    gl.uniform3f(sp.uniforms.uColor, Math.min(0.5, Math.hypot(du, dv) * 12), 0.05, 0);
+    gl.uniform3f(sp.uniforms.uColor, Math.min(0.1, Math.hypot(du, dv) * 3), 0.03, 0);
     gl.uniform1f(sp.uniforms.uRadius, 0.0016);
     this.blit(this.dye.write);
     this.dye.swap();
@@ -565,19 +565,21 @@ export class LampEngine {
     b.fill(0);
     const t = this.time;
     const bass = this.bass * this.params.drive;
-    // four wandering incense-thin streams rising from below the frame
+    // four wandering sources below the frame that breathe out wide puffs
     for (let i = 0; i < 4; i++) {
       const o = i * 4;
       const lane = (i + 0.5) / 4;
-      const x = lane + 0.16 * noise1(t * 0.03 + i * 37.7);
-      const puff = Math.max(0, noise1(t * 0.09 + i * 11.3) * 0.7 + 0.45);
-      a[o] = Math.min(0.97, Math.max(0.03, x));
-      a[o + 1] = 0.035;
-      a[o + 2] = 0.00035 + 0.00025 * (noise1(t * 0.07 + i * 5.1) * 0.5 + 0.5);
-      a[o + 3] = 3.2 * puff;
-      b[o] = 2.4 * puff;
-      b[o + 1] = noise1(t * 0.25 + i * 3.3) * 14;
-      b[o + 2] = 34 + puff * 16;
+      const x = lane + 0.1 * noise1(t * 0.03 + i * 37.7);
+      // bursty: mostly quiet, then a soft swell of smoke
+      const swell = noise1(t * 0.16 + i * 11.3) * 1.25 + 0.15;
+      const puff = Math.max(0, swell) ** 1.5;
+      a[o] = Math.min(0.9, Math.max(0.1, x));
+      a[o + 1] = 0.03;
+      a[o + 2] = 0.0035 + 0.0025 * (noise1(t * 0.07 + i * 5.1) * 0.5 + 0.5);
+      a[o + 3] = 0.3 * puff;
+      b[o] = 1.2 * puff;
+      b[o + 1] = noise1(t * 0.2 + i * 3.3) * 8;
+      b[o + 2] = 10 + puff * 10;
     }
     // warm air off the cap: a thin, hot plume that pulses with the bass
     const aspect = this.aspect();
@@ -622,8 +624,8 @@ export class LampEngine {
     gl.uniform1f(f.uniforms.uAspect, aspect);
     gl.uniform1f(f.uniforms.uDt, dt);
     gl.uniform1f(f.uniforms.uTime, this.time);
-    gl.uniform1f(f.uniforms.uTurb, 0.5 + this.params.swirl * 1.4);
-    gl.uniform1f(f.uniforms.uBuoy, 30);
+    gl.uniform1f(f.uniforms.uTurb, 0.9 + this.params.swirl * 1.8);
+    gl.uniform1f(f.uniforms.uBuoy, 24);
     this.blit(vel.write);
     vel.swap();
 
@@ -641,7 +643,7 @@ export class LampEngine {
     gl.uniform1i(vo.uniforms.uVelocity, 0);
     gl.uniform1i(vo.uniforms.uCurl, 1);
     gl.uniform2f(vo.uniforms.uTexel, texel[0], texel[1]);
-    gl.uniform1f(vo.uniforms.uCurlStrength, 20);
+    gl.uniform1f(vo.uniforms.uCurlStrength, 6);
     gl.uniform1f(vo.uniforms.uDt, dt);
     this.blit(vel.write);
     vel.swap();
@@ -697,7 +699,7 @@ export class LampEngine {
 
     this.bind(0, vel.read.texture);
     this.bind(1, dye.read.texture);
-    gl.uniform1f(ad.uniforms.uDissipation, Math.exp(-0.085 * dt));
+    gl.uniform1f(ad.uniforms.uDissipation, Math.exp(-0.11 * dt));
     this.blit(dye.write);
     dye.swap();
   }

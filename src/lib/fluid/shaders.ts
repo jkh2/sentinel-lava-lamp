@@ -157,7 +157,7 @@ void main() {
   }
 
   // slow, evolving room draft: curl of 3D value noise (divergence-free)
-  vec3 q = vec3(vUv.x * uAspect * 2.2, vUv.y * 2.2, uTime * 0.045);
+  vec3 q = vec3(vUv.x * uAspect * 1.1, vUv.y * 1.1, uTime * 0.035);
   float e = 0.02;
   float n1 = vnoise(q + vec3(0.0, e, 0.0)) + 0.5 * vnoise(q * 2.3 + vec3(0.0, e * 2.3, 7.0));
   float n2 = vnoise(q - vec3(0.0, e, 0.0)) + 0.5 * vnoise(q * 2.3 - vec3(0.0, e * 2.3, -7.0));
@@ -349,19 +349,23 @@ void main() {
     vec2 lp = toScreen(vec2(0.0, clamp(p.y, 0.36, 0.76)));
     vec2 dir = lp - vUv;
     float len = length(dir * vec2(uAspect, 1.0));
-    vec2 stepUv = dir / 6.0 * min(1.0, 0.3 / max(len, 1e-4));
+    float reach = min(len, 0.3);
+    vec2 stepUv = dir / 6.0 * (reach / max(len, 1e-4));
     float acc = 0.0;
     vec2 s = vUv;
     for (int i = 0; i < 6; i++) {
       s += stepUv;
       acc += texture(uDye, s).r;
     }
-    float trans = exp(-acc * 0.55);
-    vec3 lit = uLight * (0.05 + 1.35 * fall) * trans;
-    vec3 amb = vec3(0.022, 0.024, 0.03);
-    float alpha = 1.0 - exp(-d * 1.4);
-    vec3 smoke = (amb + lit) * alpha;
-    col = col * (1.0 - alpha * 0.55) + smoke;
+    // optical depth toward the lamp, scaled by how far we actually marched
+    float shadow = mix(0.4, 1.0, exp(-acc * (reach / 0.3) * 0.45));
+    vec3 lit = uLight * (0.05 + 1.35 * fall) * shadow;
+    // multiple scattering: thick smoke takes on the room's own light, so a
+    // dense knot reads as a lit billow, never as a dark stain
+    vec3 scatter = col * 1.5 + vec3(0.02, 0.022, 0.027);
+    float alpha = 1.0 - exp(-d * 1.15);
+    vec3 smoke = (scatter + lit) * alpha;
+    col = col * (1.0 - alpha * 0.35) + smoke;
   }
   fragColor = vec4(col, 1.0);
 }
