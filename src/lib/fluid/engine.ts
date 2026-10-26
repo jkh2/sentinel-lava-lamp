@@ -1,5 +1,12 @@
-import { lampFrame, type LampFrame } from "@/lib/lamp/geometry";
-import { WaxGobs } from "@/lib/lamp/gobs";
+import {
+  CAP_TOP,
+  insideGlass,
+  lampLayout,
+  lampToScreen,
+  screenToLamp,
+  type LampLayout,
+} from "@/lib/lamp/geometry";
+import { GOB_SLOTS, WaxGobs } from "@/lib/lamp/gobs";
 import type { Palette } from "@/lib/lamp/palettes";
 import * as S from "./shaders";
 
@@ -35,7 +42,13 @@ interface Program {
   uniforms: Record<string, WebGLUniformLocation | null>;
 }
 
-const SIM_ASPECT = 3.2;
+interface Format {
+  internal: number;
+  format: number;
+  type: number;
+  filter: number;
+  signed: boolean;
+}
 
 function compile(gl: WebGL2RenderingContext, type: number, src: string) {
   const sh = gl.createShader(type);
@@ -51,10 +64,10 @@ function compile(gl: WebGL2RenderingContext, type: number, src: string) {
   return sh;
 }
 
-function makeProgram(gl: WebGL2RenderingContext, vs: string, fs: string): Program {
+function makeProgram(gl: WebGL2RenderingContext, fs: string): Program {
   const prog = gl.createProgram();
   if (!prog) throw new Error("Failed to create program");
-  const v = compile(gl, gl.VERTEX_SHADER, vs);
+  const v = compile(gl, gl.VERTEX_SHADER, S.VERT);
   const f = compile(gl, gl.FRAGMENT_SHADER, fs);
   gl.attachShader(prog, v);
   gl.attachShader(prog, f);
@@ -71,26 +84,19 @@ function makeProgram(gl: WebGL2RenderingContext, vs: string, fs: string): Progra
     const info = gl.getActiveUniform(prog, i);
     if (!info) continue;
     uniforms[info.name] = gl.getUniformLocation(prog, info.name);
+    if (info.name.endsWith("[0]")) {
+      uniforms[info.name.slice(0, -3)] = uniforms[info.name];
+    }
   }
   return { id: prog, uniforms };
 }
 
-function supportFormat(
-  gl: WebGL2RenderingContext,
-  internal: number,
-  format: number,
-  type: number,
-) {
+function renderable(gl: WebGL2RenderingContext, internal: number, format: number, type: number) {
   const tex = gl.createTexture();
-  if (!tex) return false;
-  gl.bindTexture(gl.TEXTURE_2D, tex);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  gl.texImage2D(gl.TEXTURE_2D, 0, internal, 8, 8, 0, format, type, null);
   const fbo = gl.createFramebuffer();
-  if (!fbo) return false;
+  if (!tex || !fbo) return false;
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, internal, 4, 4, 0, format, type, null);
   gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
   gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
   const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
@@ -100,93 +106,128 @@ function supportFormat(
   return ok;
 }
 
-function pickFormat(gl: WebGL2RenderingContext) {
+function pickFormat(gl: WebGL2RenderingContext): Format {
   gl.getExtension("EXT_color_buffer_float");
   gl.getExtension("EXT_color_buffer_half_float");
-  gl.getExtension("OES_texture_float_linear");
-  gl.getExtension("OES_texture_half_float_linear");
-  if (supportFormat(gl, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT)) {
-    return { internal: gl.RGBA16F, format: gl.RGBA, type: gl.HALF_FLOAT, filter: gl.NEAREST };
+  const floatLinear = !!gl.getExtension("OES_texture_float_linear");
+  // RGBA16F is filterable in core WebGL2; 32F needs the extension.
+  if (renderable(gl, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT)) {
+    return { internal: gl.RGBA16F, format: gl.RGBA, type: gl.HALF_FLOAT, filter: gl.LINEAR, signed: true };
   }
-  if (supportFormat(gl, gl.RGBA32F, gl.RGBA, gl.FLOAT)) {
-    return { internal: gl.RGBA32F, format: gl.RGBA, type: gl.FLOAT, filter: gl.LINEAR };
+  if (renderable(gl, gl.RGBA32F, gl.RGBA, gl.FLOAT)) {
+    return {
+      internal: gl.RGBA32F,
+      format: gl.RGBA,
+      type: gl.FLOAT,
+      filter: floatLinear ? gl.LINEAR : gl.NEAREST,
+      signed: true,
+    };
   }
-  return { internal: gl.RGBA, format: gl.RGBA, type: gl.UNSIGNED_BYTE, filter: gl.LINEAR };
+  return { internal: gl.RGBA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE, filter: gl.LINEAR, signed: false };
 }
+
+function hash(n: number) {
+  const s = Math.sin(n * 127.1) * 43758.5453;
+  return s - Math.floor(s);
+}
+/** Smooth, non-repeating 1D value noise in [-1, 1]. */
+function noise1(t: number) {
+  const i = Math.floor(t);
+  const f = t - i;
+  const u = f * f * (3 - 2 * f);
+  return (hash(i) + (hash(i + 1) - hash(i)) * u) * 2 - 1;
+}
+
+const EMITTERS = 6;
 
 export class LampEngine {
   readonly canvas: HTMLCanvasElement;
   params: LampParams;
   bass = 0;
   time = 0;
+  destroyed = false;
   private gl: WebGL2RenderingContext;
-  private format: ReturnType<typeof pickFormat>;
-  private programs: {
-    splat: Program;
-    vortex: Program;
-    advect: Program;
-    divergence: Program;
-    curl: Program;
-    vorticity: Program;
-    pressure: Program;
-    gradient: Program;
-    diffuse: Program;
-    clear: Program;
-    thermal: Program;
-    forces: Program;
-    sharpen: Program;
-    smoke: Program;
-    display: Program;
-  };
+  private format: Format;
+  private programs: Record<
+    | "splat"
+    | "inject"
+    | "forces"
+    | "advect"
+    | "divergence"
+    | "curl"
+    | "vorticity"
+    | "pressure"
+    | "gradient"
+    | "scale"
+    | "backdrop"
+    | "lamp"
+    | "prefilter"
+    | "blur"
+    | "final",
+    Program
+  >;
   private vao: WebGLVertexArrayObject;
-  private dye!: DoubleFBO;
   private velocity!: DoubleFBO;
+  private dye!: DoubleFBO;
   private pressure!: DoubleFBO;
   private divergence!: FBO;
   private curl!: FBO;
-  private simW = 0;
-  private pressureIters = 20;
-  private lastW = 0;
-  private lastH = 0;
-  private needsSeed = true;
+  private scene!: FBO;
+  private comp!: FBO;
+  private bloomA!: DoubleFBO;
+  private bloomB!: DoubleFBO;
+  private envTex: WebGLTexture;
+  private noiseTex: WebGLTexture;
   private gobs = new WaxGobs();
-  destroyed = false;
+  private layout: LampLayout = lampLayout(1280, 800);
+  private cssW = 0;
+  private cssH = 0;
+  private renderScale = 1;
+  private allocatedFor = "";
+  private simAspect = 0;
+  private frameEma = 16;
+  private slowFor = 0;
+  private fastFor = 0;
+  private emitA = new Float32Array(EMITTERS * 4);
+  private emitB = new Float32Array(EMITTERS * 4);
+  private readonly smokeOn: boolean;
 
   constructor(canvas: HTMLCanvasElement, params: LampParams) {
     this.canvas = canvas;
     this.params = params;
     const gl = canvas.getContext("webgl2", {
-      alpha: true,
+      alpha: false,
       antialias: false,
       depth: false,
       stencil: false,
       premultipliedAlpha: false,
-      preserveDrawingBuffer: true,
+      preserveDrawingBuffer: false,
       powerPreference: "high-performance",
     });
     if (!gl) throw new Error("WebGL2 is required for the lava lamp.");
     this.gl = gl;
     this.format = pickFormat(gl);
+    this.smokeOn = this.format.signed;
     gl.disable(gl.DEPTH_TEST);
     gl.disable(gl.BLEND);
     gl.disable(gl.CULL_FACE);
 
     this.programs = {
-      splat: makeProgram(gl, S.VERT, S.SPLAT),
-      vortex: makeProgram(gl, S.VERT, S.VORTEX),
-      advect: makeProgram(gl, S.VERT, S.ADVECT),
-      divergence: makeProgram(gl, S.VERT, S.DIVERGENCE),
-      curl: makeProgram(gl, S.VERT, S.CURL),
-      vorticity: makeProgram(gl, S.VERT, S.VORTICITY),
-      pressure: makeProgram(gl, S.VERT, S.PRESSURE),
-      gradient: makeProgram(gl, S.VERT, S.GRADIENT),
-      diffuse: makeProgram(gl, S.VERT, S.DIFFUSE),
-      clear: makeProgram(gl, S.VERT, S.CLEAR),
-      thermal: makeProgram(gl, S.VERT, S.THERMAL),
-      forces: makeProgram(gl, S.VERT, S.FORCES),
-      sharpen: makeProgram(gl, S.VERT, S.SHARPEN),
-      smoke: makeProgram(gl, S.VERT, S.SMOKE_FORCE),
-      display: makeProgram(gl, S.VERT, S.DISPLAY),
+      splat: makeProgram(gl, S.SPLAT),
+      inject: makeProgram(gl, S.INJECT),
+      forces: makeProgram(gl, S.FORCES),
+      advect: makeProgram(gl, S.ADVECT),
+      divergence: makeProgram(gl, S.DIVERGENCE),
+      curl: makeProgram(gl, S.CURL),
+      vorticity: makeProgram(gl, S.VORTICITY),
+      pressure: makeProgram(gl, S.PRESSURE),
+      gradient: makeProgram(gl, S.GRADIENT),
+      scale: makeProgram(gl, S.SCALE),
+      backdrop: makeProgram(gl, S.BACKDROP),
+      lamp: makeProgram(gl, S.LAMP_PASS),
+      prefilter: makeProgram(gl, S.BLOOM_PREFILTER),
+      blur: makeProgram(gl, S.BLUR),
+      final: makeProgram(gl, S.FINAL),
     };
 
     const vao = gl.createVertexArray();
@@ -199,53 +240,53 @@ export class LampEngine {
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
 
-    this.allocate();
+    this.envTex = this.loadTexture("/env-studio.jpg", [10, 9, 9, 255], true);
+    this.noiseTex = this.loadTexture("/blue-noise.png", [128, 128, 128, 255], false);
+
+    this.gobs.seed();
     this.resize();
-    if (this.lastW > 2) {
-      this.seed();
-      this.draw();
-    }
   }
 
-  private allocate() {
-    const narrow = this.canvas.clientWidth > 0 && this.canvas.clientWidth < 840;
-    const base = narrow ? 96 : 128;
-    const dyeBase = narrow ? 168 : 220;
-    this.pressureIters = narrow ? 16 : 22;
-    const sim = { width: base, height: Math.round(base * SIM_ASPECT) };
-    const dye = { width: dyeBase, height: Math.round(dyeBase * SIM_ASPECT) };
-    this.simW = sim.width;
-    this.velocity = this.makeDouble(sim.width, sim.height);
-    this.dye = this.makeDouble(dye.width, dye.height);
-    this.pressure = this.makeDouble(sim.width, sim.height);
-    this.divergence = this.makeFBO(sim.width, sim.height);
-    this.curl = this.makeFBO(sim.width, sim.height);
-    this.needsSeed = true;
-  }
+  // ---- resources ----------------------------------------------------------
 
-  resize() {
+  private loadTexture(src: string, fallback: number[], mips: boolean) {
     const gl = this.gl;
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const w = Math.max(2, Math.round(this.canvas.clientWidth * dpr));
-    const h = Math.max(2, Math.round(this.canvas.clientHeight * dpr));
-    if (this.canvas.clientWidth < 4 || this.canvas.clientHeight < 4) return;
-    if (w === this.lastW && h === this.lastH) return;
-    this.canvas.width = w;
-    this.canvas.height = h;
-    this.lastW = w;
-    this.lastH = h;
-    gl.viewport(0, 0, w, h);
+    const tex = gl.createTexture();
+    if (!tex) throw new Error("Failed to create texture");
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(fallback));
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, mips ? gl.LINEAR : gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, mips ? gl.LINEAR : gl.NEAREST);
+    const img = new Image();
+    img.decoding = "async";
+    img.onload = () => {
+      if (this.destroyed) return;
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, img);
+      if (mips) {
+        gl.generateMipmap(gl.TEXTURE_2D);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      } else {
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+      }
+    };
+    img.src = src;
+    return tex;
   }
 
-  private makeFBO(width: number, height: number): FBO {
+  private makeFBO(width: number, height: number, linear = true): FBO {
     const gl = this.gl;
     const { internal, format, type, filter } = this.format;
     const texture = gl.createTexture();
     const fbo = gl.createFramebuffer();
     if (!texture || !fbo) throw new Error("Failed to allocate field buffer");
+    const f = linear ? filter : gl.NEAREST;
     gl.bindTexture(gl.TEXTURE_2D, texture);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, f);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, f);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texImage2D(gl.TEXTURE_2D, 0, internal, width, height, 0, format, type, null);
@@ -256,9 +297,15 @@ export class LampEngine {
     return { texture, fbo, width, height, texel: [1 / width, 1 / height] };
   }
 
-  private makeDouble(width: number, height: number): DoubleFBO {
-    let a = this.makeFBO(width, height);
-    let b = this.makeFBO(width, height);
+  private freeFBO(f: FBO | undefined) {
+    if (!f) return;
+    this.gl.deleteTexture(f.texture);
+    this.gl.deleteFramebuffer(f.fbo);
+  }
+
+  private makeDouble(width: number, height: number, linear = true): DoubleFBO {
+    let a = this.makeFBO(width, height, linear);
+    let b = this.makeFBO(width, height, linear);
     return {
       get read() {
         return a;
@@ -274,6 +321,81 @@ export class LampEngine {
     };
   }
 
+  private freeDouble(d: DoubleFBO | undefined) {
+    if (!d) return;
+    this.freeFBO(d.read);
+    this.freeFBO(d.write);
+  }
+
+  /** Called every frame; cheap unless the canvas size or quality changed. */
+  resize() {
+    const cw = this.canvas.clientWidth;
+    const ch = this.canvas.clientHeight;
+    if (cw < 4 || ch < 4) return false;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    let w = Math.round(cw * dpr);
+    let h = Math.round(ch * dpr);
+    const cap = 2.6e6;
+    if (w * h > cap) {
+      const k = Math.sqrt(cap / (w * h));
+      w = Math.round(w * k);
+      h = Math.round(h * k);
+    }
+    if (this.canvas.width !== w || this.canvas.height !== h) {
+      this.canvas.width = w;
+      this.canvas.height = h;
+    }
+    if (cw !== this.cssW || ch !== this.cssH) {
+      this.cssW = cw;
+      this.cssH = ch;
+      this.layout = lampLayout(cw, ch);
+    }
+    const key = `${w}x${h}@${this.renderScale.toFixed(2)}`;
+    if (key === this.allocatedFor) return true;
+    this.allocatedFor = key;
+
+    const aspect = w / h;
+    const narrow = cw < 840;
+    // Fluid grids follow the screen's aspect. Rebuild only when it changes
+    // enough to matter, so a scrollbar or URL bar doesn't wipe the smoke.
+    if (!this.velocity || Math.abs(aspect - this.simAspect) / this.simAspect > 0.08) {
+      this.simAspect = aspect;
+      const simMin = narrow ? 96 : 120;
+      const dyeMin = narrow ? 256 : 380;
+      const dims = (m: number) =>
+        aspect >= 1
+          ? { w: Math.round(m * aspect), h: m }
+          : { w: m, h: Math.round(m / aspect) };
+      const sim = dims(simMin);
+      const dye = dims(dyeMin);
+      this.freeDouble(this.velocity);
+      this.freeDouble(this.dye);
+      this.freeDouble(this.pressure);
+      this.freeFBO(this.divergence);
+      this.freeFBO(this.curl);
+      this.velocity = this.makeDouble(sim.w, sim.h);
+      this.dye = this.makeDouble(dye.w, dye.h);
+      this.pressure = this.makeDouble(sim.w, sim.h, false);
+      this.divergence = this.makeFBO(sim.w, sim.h, false);
+      this.curl = this.makeFBO(sim.w, sim.h, false);
+      this.prewarm();
+    }
+
+    const rw = Math.max(2, Math.round(w * this.renderScale));
+    const rh = Math.max(2, Math.round(h * this.renderScale));
+    this.freeFBO(this.scene);
+    this.freeFBO(this.comp);
+    this.freeDouble(this.bloomA);
+    this.freeDouble(this.bloomB);
+    this.scene = this.makeFBO(Math.max(2, rw >> 1), Math.max(2, rh >> 1));
+    this.comp = this.makeFBO(rw, rh);
+    this.bloomA = this.makeDouble(Math.max(2, rw >> 2), Math.max(2, rh >> 2));
+    this.bloomB = this.makeDouble(Math.max(2, rw >> 3), Math.max(2, rh >> 3));
+    return true;
+  }
+
+  // ---- helpers ------------------------------------------------------------
+
   private blit(target: FBO | null) {
     const gl = this.gl;
     if (target) {
@@ -283,7 +405,6 @@ export class LampEngine {
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
     }
-    gl.bindVertexArray(this.vao);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 
@@ -293,205 +414,379 @@ export class LampEngine {
     gl.bindTexture(gl.TEXTURE_2D, texture);
   }
 
-  splat(
-    x: number,
-    y: number,
-    vx: number,
-    vy: number,
-    color: [number, number, number],
-    radius: number,
-  ) {
+  private aspect() {
+    return this.canvas.width / Math.max(1, this.canvas.height);
+  }
+
+  private setLayout(p: Program) {
     const gl = this.gl;
-    const aspect = 1 / SIM_ASPECT;
-    const sp = this.programs.splat;
-    gl.useProgram(sp.id);
-    this.bind(0, this.velocity.read.texture);
-    gl.uniform1i(sp.uniforms.uTarget, 0);
-    gl.uniform2f(sp.uniforms.uPoint, x, y);
-    gl.uniform3f(sp.uniforms.uColor, vx, vy, 0);
-    gl.uniform1f(sp.uniforms.uRadius, radius);
-    gl.uniform1f(sp.uniforms.uAspect, aspect);
-    this.blit(this.velocity.write);
-    this.velocity.swap();
-
-    this.bind(0, this.dye.read.texture);
-    gl.uniform1i(sp.uniforms.uTarget, 0);
-    gl.uniform3f(sp.uniforms.uColor, color[0], color[1], color[2]);
-    gl.uniform1f(sp.uniforms.uRadius, radius * 0.92);
-    this.blit(this.dye.write);
-    this.dye.swap();
+    const l = this.layout;
+    gl.uniform3f(p.uniforms.uLayout, l.cx, l.floor, l.height);
+    gl.uniform1f(p.uniforms.uAspect, this.aspect());
   }
 
-  stir(x: number, y: number, dx: number, dy: number, drip: boolean) {
-    this.gobs.stir(x, y, dx, dy, drip);
+  private lightColor(): [number, number, number] {
+    const pal = this.params.palette;
+    const k = (0.5 + this.params.glow * 1.2) * (1 + this.bass * this.params.drive * 0.7);
+    return [
+      (pal.mid[0] * 0.55 + pal.hot[0] * 0.45) * k,
+      (pal.mid[1] * 0.55 + pal.hot[1] * 0.45) * k,
+      (pal.mid[2] * 0.55 + pal.hot[2] * 0.45) * k,
+    ];
   }
 
-  private vortex(x: number, y: number, strength: number, radius: number) {
-    const gl = this.gl;
-    const p = this.programs.vortex;
-    gl.useProgram(p.id);
-    this.bind(0, this.velocity.read.texture);
-    gl.uniform1i(p.uniforms.uTarget, 0);
-    gl.uniform2f(p.uniforms.uPoint, x, y);
-    gl.uniform1f(p.uniforms.uStrength, strength);
-    gl.uniform1f(p.uniforms.uRadius, radius);
-    gl.uniform1f(p.uniforms.uAspect, 1 / SIM_ASPECT);
-    this.blit(this.velocity.write);
-    this.velocity.swap();
-  }
+  // ---- public API ---------------------------------------------------------
 
   seed() {
     this.gobs.seed();
-    this.needsSeed = false;
   }
 
-  private clearFields() {
-    const gl = this.gl;
-    for (const fbo of [
-      this.dye.read,
-      this.dye.write,
-      this.velocity.read,
-      this.velocity.write,
-      this.pressure.read,
-      this.pressure.write,
-      this.divergence,
-      this.curl,
-    ]) {
-      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo.fbo);
-      gl.viewport(0, 0, fbo.width, fbo.height);
-      gl.clearColor(0, 0, 0, 1);
-      gl.clear(gl.COLOR_BUFFER_BIT);
+  /**
+   * Pointer drag in bottom-left screen UV. Inside the glass it nudges the wax
+   * (or drips a new gob); outside it pushes the smoke around.
+   */
+  drag(u: number, v: number, du: number, dv: number, drip: boolean) {
+    const aspect = this.aspect();
+    const p = screenToLamp(this.layout, aspect, u, v);
+    if (insideGlass(p.x, p.y)) {
+      const scale = this.layout.height;
+      this.gobs.stir(p.x, p.y, (du * aspect) / scale, dv / scale, drip, this.params.wax);
+      return;
     }
+    if (!this.smokeOn || !this.velocity) return;
+    const gl = this.gl;
+    const sp = this.programs.splat;
+    gl.useProgram(sp.id);
+    gl.uniform2f(sp.uniforms.uPoint, u, v);
+    gl.uniform1f(sp.uniforms.uAspect, aspect);
+    this.bind(0, this.velocity.read.texture);
+    gl.uniform1i(sp.uniforms.uTarget, 0);
+    gl.uniform3f(sp.uniforms.uColor, du * 5200, dv * 5200, 0);
+    gl.uniform1f(sp.uniforms.uRadius, 0.0022);
+    this.blit(this.velocity.write);
+    this.velocity.swap();
+    this.bind(0, this.dye.read.texture);
+    gl.uniform3f(sp.uniforms.uColor, Math.min(0.5, Math.hypot(du, dv) * 12), 0.05, 0);
+    gl.uniform1f(sp.uniforms.uRadius, 0.0016);
+    this.blit(this.dye.write);
+    this.dye.swap();
   }
 
   step(dt: number) {
     if (this.destroyed) return;
-    this.resize();
-    if (!this.dye) return;
-    if (this.needsSeed && this.lastW > 2) this.seed();
-    if (this.params.paused) {
-      this.draw();
-      return;
+    if (!this.resize()) return;
+    const t = Math.min(Math.max(dt, 1 / 240), 1 / 30);
+    this.govern(dt);
+    if (!this.params.paused) {
+      this.time += t;
+      const p = this.params;
+      this.gobs.update(t, {
+        heat: p.heat,
+        rise: p.rise,
+        thickness: p.thickness,
+        swirl: p.swirl,
+        wax: p.wax,
+        chill: p.chill,
+        drive: p.drive,
+        bass: this.bass,
+      });
+      if (this.smokeOn) this.simulate(t);
     }
-    const t = Math.min(Math.max(dt, 0.001), 0.033);
-    this.time += t;
+    this.render();
+  }
+
+  /** Run physics forward by `seconds` without rendering (dev QA). */
+  advance(seconds: number) {
     const p = this.params;
-    this.gobs.update(
-      t,
-      p.heat,
-      p.rise,
-      p.thickness,
-      p.swirl,
-      p.wax,
-      p.chill,
-      p.drive,
-      this.bass,
-    );
-    this.draw();
-    return;
+    for (let t = 0; t < seconds; t += 1 / 30) {
+      this.time += 1 / 30;
+      this.gobs.update(1 / 30, {
+        heat: p.heat,
+        rise: p.rise,
+        thickness: p.thickness,
+        swirl: p.swirl,
+        wax: p.wax,
+        chill: p.chill,
+        drive: p.drive,
+        bass: this.bass,
+      });
+      if (this.smokeOn) this.simulate(1 / 30);
+    }
   }
 
-  private smokePuff(x: number, y: number, amount: number, lift: number) {
-    const gl = this.gl;
-    const aspect = gl.drawingBufferWidth / Math.max(1, gl.drawingBufferHeight);
-    const sp = this.programs.splat;
-    gl.useProgram(sp.id);
-    this.bind(0, this.velocity.read.texture);
-    gl.uniform1i(sp.uniforms.uTarget, 0);
-    gl.uniform2f(sp.uniforms.uPoint, x, y);
-    gl.uniform3f(sp.uniforms.uColor, (Math.random() - 0.5) * 8, lift, 0);
-    gl.uniform1f(sp.uniforms.uRadius, 0.012);
-    gl.uniform1f(sp.uniforms.uAspect, aspect);
-    this.blit(this.velocity.write);
-    this.velocity.swap();
-
-    this.bind(0, this.dye.read.texture);
-    gl.uniform1i(sp.uniforms.uTarget, 0);
-    gl.uniform3f(sp.uniforms.uColor, amount, amount * 0.4, 0);
-    gl.uniform1f(sp.uniforms.uRadius, 0.02 + amount * 0.03);
-    this.blit(this.dye.write);
-    this.dye.swap();
+  destroy() {
+    // Don't lose the context: React's dev double-mount reuses this canvas.
+    this.destroyed = true;
   }
 
-  private smokeStep(dt: number) {
-    const gl = this.gl;
-    const frame = this.frame();
-    const puff = 0.16 + this.bass * this.params.drive * 0.55;
-    const foot = frame.cy - frame.height * 0.46;
-    const sway = Math.sin(this.time * 0.7) * 0.05;
-    this.smokePuff(frame.cx - 0.05 + sway, foot, puff, 28 + this.bass * 50);
-    this.smokePuff(frame.cx + 0.06 - sway * 0.6, foot + 0.03, puff * 0.7, 18 + this.bass * 30);
+  // ---- adaptive quality: hold frame pacing on slower GPUs ----------------
 
-    const dye = this.dye;
+  private govern(dt: number) {
+    const ms = dt * 1000;
+    if (ms > 200) return; // tab was hidden; ignore
+    this.frameEma += (ms - this.frameEma) * 0.05;
+    if (this.frameEma > 24) {
+      this.slowFor += dt;
+      this.fastFor = 0;
+    } else if (this.frameEma < 14) {
+      this.fastFor += dt;
+      this.slowFor = 0;
+    } else {
+      this.slowFor = 0;
+      this.fastFor = 0;
+    }
+    if (this.slowFor > 1.5 && this.renderScale > 0.55) {
+      this.renderScale = Math.max(0.55, this.renderScale * 0.85);
+      this.slowFor = 0;
+      this.frameEma = 16;
+    } else if (this.fastFor > 6 && this.renderScale < 1) {
+      this.renderScale = Math.min(1, this.renderScale * 1.1);
+      this.fastFor = 0;
+    }
+  }
+
+  // ---- smoke --------------------------------------------------------------
+
+  /** Run the smoke for a few seconds up front so the first frame has wisps. */
+  private prewarm() {
+    if (!this.smokeOn) return;
+    const keep = this.time;
+    for (let i = 0; i < 240; i++) {
+      this.time += 1 / 30;
+      this.simulate(1 / 30);
+    }
+    this.time = keep;
+  }
+
+  private updateEmitters() {
+    const a = this.emitA;
+    const b = this.emitB;
+    a.fill(0);
+    b.fill(0);
+    const t = this.time;
+    const bass = this.bass * this.params.drive;
+    // four wandering incense-thin streams rising from below the frame
+    for (let i = 0; i < 4; i++) {
+      const o = i * 4;
+      const lane = (i + 0.5) / 4;
+      const x = lane + 0.16 * noise1(t * 0.03 + i * 37.7);
+      const puff = Math.max(0, noise1(t * 0.09 + i * 11.3) * 0.7 + 0.45);
+      a[o] = Math.min(0.97, Math.max(0.03, x));
+      a[o + 1] = 0.035;
+      a[o + 2] = 0.00035 + 0.00025 * (noise1(t * 0.07 + i * 5.1) * 0.5 + 0.5);
+      a[o + 3] = 3.2 * puff;
+      b[o] = 2.4 * puff;
+      b[o + 1] = noise1(t * 0.25 + i * 3.3) * 14;
+      b[o + 2] = 34 + puff * 16;
+    }
+    // warm air off the cap: a thin, hot plume that pulses with the bass
+    const aspect = this.aspect();
+    const cap = lampToScreen(this.layout, aspect, 0, CAP_TOP + 0.02);
+    const o = 4 * 4;
+    a[o] = cap.u + noise1(t * 0.3) * 0.002;
+    a[o + 1] = cap.v;
+    a[o + 2] = 0.0005;
+    a[o + 3] = 1.6 + bass * 2.2;
+    b[o] = 0.9 + bass * 1.4;
+    b[o + 1] = noise1(t * 0.5 + 9) * 6;
+    b[o + 2] = 14 + bass * 20;
+  }
+
+  private simulate(dt: number) {
+    const gl = this.gl;
     const vel = this.velocity;
+    const dye = this.dye;
     const texel = vel.read.texel;
-    const smoke = this.programs.smoke;
-    gl.useProgram(smoke.id);
+    const aspect = this.aspect();
+    this.updateEmitters();
+
+    const inj = this.programs.inject;
+    gl.useProgram(inj.id);
+    this.bind(0, dye.read.texture);
+    gl.uniform1i(inj.uniforms.uDye, 0);
+    gl.uniform4fv(inj.uniforms.uEmitA, this.emitA);
+    gl.uniform4fv(inj.uniforms.uEmitB, this.emitB);
+    gl.uniform1f(inj.uniforms.uAspect, aspect);
+    gl.uniform1f(inj.uniforms.uDt, dt);
+    this.blit(dye.write);
+    dye.swap();
+
+    const f = this.programs.forces;
+    gl.useProgram(f.id);
     this.bind(0, vel.read.texture);
     this.bind(1, dye.read.texture);
-    gl.uniform1i(smoke.uniforms.uVelocity, 0);
-    gl.uniform1i(smoke.uniforms.uDye, 1);
-    gl.uniform1f(smoke.uniforms.uDt, dt);
-    gl.uniform1f(smoke.uniforms.uBass, this.bass * this.params.drive);
-    gl.uniform1f(smoke.uniforms.uTime, this.time);
+    gl.uniform1i(f.uniforms.uVelocity, 0);
+    gl.uniform1i(f.uniforms.uDye, 1);
+    gl.uniform4fv(f.uniforms.uEmitA, this.emitA);
+    gl.uniform4fv(f.uniforms.uEmitB, this.emitB);
+    gl.uniform1f(f.uniforms.uAspect, aspect);
+    gl.uniform1f(f.uniforms.uDt, dt);
+    gl.uniform1f(f.uniforms.uTime, this.time);
+    gl.uniform1f(f.uniforms.uTurb, 0.5 + this.params.swirl * 1.4);
+    gl.uniform1f(f.uniforms.uBuoy, 30);
     this.blit(vel.write);
     vel.swap();
 
-    const adv = this.programs.advect;
-    gl.useProgram(adv.id);
+    const c = this.programs.curl;
+    gl.useProgram(c.id);
+    this.bind(0, vel.read.texture);
+    gl.uniform1i(c.uniforms.uVelocity, 0);
+    gl.uniform2f(c.uniforms.uTexel, texel[0], texel[1]);
+    this.blit(this.curl);
+
+    const vo = this.programs.vorticity;
+    gl.useProgram(vo.id);
+    this.bind(0, vel.read.texture);
+    this.bind(1, this.curl.texture);
+    gl.uniform1i(vo.uniforms.uVelocity, 0);
+    gl.uniform1i(vo.uniforms.uCurl, 1);
+    gl.uniform2f(vo.uniforms.uTexel, texel[0], texel[1]);
+    gl.uniform1f(vo.uniforms.uCurlStrength, 20);
+    gl.uniform1f(vo.uniforms.uDt, dt);
+    this.blit(vel.write);
+    vel.swap();
+
+    const dv = this.programs.divergence;
+    gl.useProgram(dv.id);
+    this.bind(0, vel.read.texture);
+    gl.uniform1i(dv.uniforms.uVelocity, 0);
+    gl.uniform2f(dv.uniforms.uTexel, texel[0], texel[1]);
+    this.blit(this.divergence);
+
+    const sc = this.programs.scale;
+    gl.useProgram(sc.id);
+    this.bind(0, this.pressure.read.texture);
+    gl.uniform1i(sc.uniforms.uTexture, 0);
+    gl.uniform1f(sc.uniforms.uValue, 0.8);
+    this.blit(this.pressure.write);
+    this.pressure.swap();
+
+    const pr = this.programs.pressure;
+    gl.useProgram(pr.id);
+    this.bind(1, this.divergence.texture);
+    gl.uniform1i(pr.uniforms.uDivergence, 1);
+    gl.uniform1i(pr.uniforms.uPressure, 0);
+    gl.uniform2f(pr.uniforms.uTexel, texel[0], texel[1]);
+    for (let i = 0; i < 20; i++) {
+      this.bind(0, this.pressure.read.texture);
+      this.blit(this.pressure.write);
+      this.pressure.swap();
+    }
+
+    const gr = this.programs.gradient;
+    gl.useProgram(gr.id);
+    this.bind(0, this.pressure.read.texture);
+    this.bind(1, vel.read.texture);
+    gl.uniform1i(gr.uniforms.uPressure, 0);
+    gl.uniform1i(gr.uniforms.uVelocity, 1);
+    gl.uniform2f(gr.uniforms.uTexel, texel[0], texel[1]);
+    this.blit(vel.write);
+    vel.swap();
+
+    const ad = this.programs.advect;
+    gl.useProgram(ad.id);
     this.bind(0, vel.read.texture);
     this.bind(1, vel.read.texture);
-    gl.uniform1i(adv.uniforms.uVelocity, 0);
-    gl.uniform1i(adv.uniforms.uSource, 1);
-    gl.uniform2f(adv.uniforms.uTexel, texel[0], texel[1]);
-    gl.uniform2f(adv.uniforms.uVelTexel, texel[0], texel[1]);
-    gl.uniform1f(adv.uniforms.uDt, dt);
-    gl.uniform1f(adv.uniforms.uDissipation, 1);
+    gl.uniform1i(ad.uniforms.uVelocity, 0);
+    gl.uniform1i(ad.uniforms.uSource, 1);
+    gl.uniform2f(ad.uniforms.uTexel, texel[0], texel[1]);
+    gl.uniform1f(ad.uniforms.uDt, dt);
+    gl.uniform1f(ad.uniforms.uDissipation, Math.exp(-0.25 * dt));
     this.blit(vel.write);
     vel.swap();
 
     this.bind(0, vel.read.texture);
     this.bind(1, dye.read.texture);
-    gl.uniform1i(adv.uniforms.uVelocity, 0);
-    gl.uniform1i(adv.uniforms.uSource, 1);
-    gl.uniform2f(adv.uniforms.uTexel, dye.read.texel[0], dye.read.texel[1]);
-    gl.uniform1f(adv.uniforms.uDissipation, Math.exp(-0.22 * dt));
+    gl.uniform1f(ad.uniforms.uDissipation, Math.exp(-0.085 * dt));
     this.blit(dye.write);
     dye.swap();
   }
 
-  private frame(): LampFrame {
-    const rect = this.canvas.getBoundingClientRect();
-    return lampFrame(rect.width || this.canvas.clientWidth, rect.height || this.canvas.clientHeight);
-  }
+  // ---- render -------------------------------------------------------------
 
-  draw() {
+  private render() {
     const gl = this.gl;
-    const p = this.programs.display;
-    const frame = this.frame();
     const pal = this.params.palette;
-    gl.useProgram(p.id);
-    this.bind(0, this.dye.read.texture);
-    gl.uniform1i(p.uniforms.uDye, 0);
-    gl.uniform2f(p.uniforms.uDyeTexel, this.dye.read.texel[0], this.dye.read.texel[1]);
-    gl.uniform2f(p.uniforms.uResolution, gl.drawingBufferWidth, gl.drawingBufferHeight);
-    gl.uniform1f(p.uniforms.uTime, this.time);
-    gl.uniform1f(p.uniforms.uGlow, this.params.glow);
-    gl.uniform1f(p.uniforms.uThreshold, 0.72 - this.params.wax * 0.46);
-    gl.uniform1f(p.uniforms.uBass, this.bass);
-    gl.uniform3f(p.uniforms.uCool, pal.cool[0], pal.cool[1], pal.cool[2]);
-    gl.uniform3f(p.uniforms.uMid, pal.mid[0], pal.mid[1], pal.mid[2]);
-    gl.uniform3f(p.uniforms.uHot, pal.hot[0], pal.hot[1], pal.hot[2]);
-    gl.uniform3f(p.uniforms.uLiquid, pal.liquid[0], pal.liquid[1], pal.liquid[2]);
-    gl.uniform1f(p.uniforms.uLampH, frame.height);
-    gl.uniform1f(p.uniforms.uLampAspect, frame.aspect);
-    gl.uniform2f(p.uniforms.uLampCenter, frame.cx, frame.cy);
-    const blobs = this.gobs.pack();
-    gl.uniform4fv(p.uniforms["uBlobs[0]"] ?? p.uniforms.uBlobs, blobs);
-    this.blit(null);
-  }
+    const light = this.lightColor();
+    const bass = this.bass * this.params.drive;
 
-  destroy() {
-    this.destroyed = true;
+    // 1. backdrop + smoke (half res)
+    const bd = this.programs.backdrop;
+    gl.useProgram(bd.id);
+    this.setLayout(bd);
+    if (this.dye) this.bind(0, this.dye.read.texture);
+    gl.uniform1i(bd.uniforms.uDye, 0);
+    gl.uniform3f(bd.uniforms.uLight, light[0], light[1], light[2]);
+    gl.uniform1f(bd.uniforms.uSmokeOn, this.smokeOn ? 1 : 0);
+    this.blit(this.scene);
+
+    // 2. lamp over the backdrop (HDR)
+    const lp = this.programs.lamp;
+    gl.useProgram(lp.id);
+    this.setLayout(lp);
+    this.bind(0, this.scene.texture);
+    this.bind(1, this.envTex);
+    gl.uniform1i(lp.uniforms.uScene, 0);
+    gl.uniform1i(lp.uniforms.uEnv, 1);
+    gl.uniform2f(lp.uniforms.uResolution, this.comp.width, this.comp.height);
+    gl.uniform1f(lp.uniforms.uTime, this.time);
+    gl.uniform1f(lp.uniforms.uGlow, this.params.glow);
+    gl.uniform1f(lp.uniforms.uBass, bass);
+    gl.uniform3f(lp.uniforms.uCool, pal.cool[0], pal.cool[1], pal.cool[2]);
+    gl.uniform3f(lp.uniforms.uMid, pal.mid[0], pal.mid[1], pal.mid[2]);
+    gl.uniform3f(lp.uniforms.uHot, pal.hot[0], pal.hot[1], pal.hot[2]);
+    gl.uniform3f(lp.uniforms.uLiquid, pal.liquid[0], pal.liquid[1], pal.liquid[2]);
+    gl.uniform3f(lp.uniforms.uLight, light[0], light[1], light[2]);
+    const blobs = this.gobs.pack(this.params.wax);
+    gl.uniform4fv(lp.uniforms.uBlobA, blobs, 0, GOB_SLOTS * 4);
+    gl.uniform4fv(lp.uniforms.uBlobB, blobs, GOB_SLOTS * 4, GOB_SLOTS * 4);
+    this.blit(this.comp);
+
+    // 3. bloom
+    const pf = this.programs.prefilter;
+    gl.useProgram(pf.id);
+    this.bind(0, this.comp.texture);
+    gl.uniform1i(pf.uniforms.uTexture, 0);
+    gl.uniform2f(pf.uniforms.uTexel, this.comp.texel[0], this.comp.texel[1]);
+    gl.uniform1f(pf.uniforms.uThreshold, 0.55);
+    this.blit(this.bloomA.read);
+
+    const bl = this.programs.blur;
+    gl.useProgram(bl.id);
+    gl.uniform1i(bl.uniforms.uTexture, 0);
+    const blur = (d: DoubleFBO) => {
+      this.bind(0, d.read.texture);
+      gl.uniform2f(bl.uniforms.uDir, d.read.texel[0], 0);
+      this.blit(d.write);
+      d.swap();
+      this.bind(0, d.read.texture);
+      gl.uniform2f(bl.uniforms.uDir, 0, d.read.texel[1]);
+      this.blit(d.write);
+      d.swap();
+    };
+    blur(this.bloomA);
+    // downsample A into B, then blur wider
+    this.bind(0, this.bloomA.read.texture);
+    gl.uniform2f(bl.uniforms.uDir, this.bloomA.read.texel[0] * 0.5, this.bloomA.read.texel[1] * 0.5);
+    this.blit(this.bloomB.read);
+    blur(this.bloomB);
+    blur(this.bloomB);
+
+    // 4. final
+    const fp = this.programs.final;
+    gl.useProgram(fp.id);
+    this.setLayout(fp);
+    this.bind(0, this.comp.texture);
+    this.bind(1, this.bloomA.read.texture);
+    this.bind(2, this.bloomB.read.texture);
+    this.bind(3, this.noiseTex);
+    gl.uniform1i(fp.uniforms.uComp, 0);
+    gl.uniform1i(fp.uniforms.uBloomA, 1);
+    gl.uniform1i(fp.uniforms.uBloomB, 2);
+    gl.uniform1i(fp.uniforms.uNoise, 3);
+    gl.uniform2f(fp.uniforms.uNoiseOffset, Math.random(), Math.random());
+    gl.uniform1f(fp.uniforms.uBloom, 0.35 + this.params.glow * 0.5 + bass * 0.25);
+    gl.uniform1f(fp.uniforms.uExposure, 1.15);
+    this.blit(null);
   }
 }

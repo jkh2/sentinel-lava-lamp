@@ -1,3 +1,11 @@
+/**
+ * GLSL for the lamp. Three groups:
+ *  1. Stable-fluids smoke solver (adapted from navier-stokes-laboratory):
+ *     density in .r, temperature in .g, buoyancy + vorticity confinement.
+ *  2. Scene passes: lit backdrop + smoke → lamp (glass, wax, metal) → bloom.
+ *  3. Final pass: table reflection, bloom, ACES tonemap, grain.
+ */
+
 export const VERT = `#version 300 es
 layout(location = 0) in vec2 aPos;
 out vec2 vUv;
@@ -7,30 +15,71 @@ void main() {
 }
 `;
 
-const BILERP = `
-vec4 bilerp(sampler2D sam, vec2 uv, vec2 tsize) {
-  vec2 st = uv / max(tsize, vec2(1e-6)) - 0.5;
-  vec2 iuv = floor(st);
-  vec2 fuv = fract(st);
-  vec4 a = texture(sam, (iuv + vec2(0.5, 0.5)) * tsize);
-  vec4 b = texture(sam, (iuv + vec2(1.5, 0.5)) * tsize);
-  vec4 c = texture(sam, (iuv + vec2(0.5, 1.5)) * tsize);
-  vec4 d = texture(sam, (iuv + vec2(1.5, 1.5)) * tsize);
-  return mix(mix(a, b, fuv.x), mix(c, d, fuv.x), fuv.y);
+const NOISE = `
+float hash3(vec3 p) {
+  p = fract(p * 0.1031);
+  p += dot(p, p.zyx + 31.32);
+  return fract((p.x + p.y) * p.z);
+}
+float vnoise(vec3 x) {
+  vec3 i = floor(x);
+  vec3 f = fract(x);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(
+    mix(mix(hash3(i), hash3(i + vec3(1, 0, 0)), f.x),
+        mix(hash3(i + vec3(0, 1, 0)), hash3(i + vec3(1, 1, 0)), f.x), f.y),
+    mix(mix(hash3(i + vec3(0, 0, 1)), hash3(i + vec3(1, 0, 1)), f.x),
+        mix(hash3(i + vec3(0, 1, 1)), hash3(i + vec3(1, 1, 1)), f.x), f.y),
+    f.z) * 2.0 - 1.0;
 }
 `;
 
-const GLASS = `
-float insideGlass(vec2 uv, float aspect) {
-  vec2 p = (uv - 0.5) * vec2(1.0, aspect);
-  float r = 0.47;
-  float halfLen = aspect * 0.5 - r;
-  vec2 pa = p - vec2(0.0, -halfLen);
-  vec2 ba = vec2(0.0, max(halfLen * 2.0, 0.001));
-  float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
-  return smoothstep(0.03, -0.02, length(pa - ba * h) - r);
+/** Exact mirror of src/lib/lamp/geometry.ts. */
+const LAMP = `
+const float BASE_TOP = 0.29;
+const float GLASS_BOTTOM = 0.285;
+const float GLASS_TOP = 0.875;
+const float CAP_BOTTOM = 0.865;
+const float CAP_TOP = 0.975;
+uniform vec3 uLayout; // cx, floor, height (screen uv)
+uniform float uAspect;
+
+vec2 toLamp(vec2 uv) {
+  return vec2((uv.x - uLayout.x) * uAspect / uLayout.z, (uv.y - uLayout.y) / uLayout.z);
+}
+vec2 toScreen(vec2 p) {
+  return vec2(uLayout.x + p.x * uLayout.z / uAspect, uLayout.y + p.y * uLayout.z);
+}
+float glassR(float y) {
+  float t = clamp((y - GLASS_BOTTOM) / (GLASS_TOP - GLASS_BOTTOM), 0.0, 1.0);
+  if (t < 0.3) {
+    float k = (0.3 - t) / 0.3;
+    return 0.09 - 0.018 * k * k;
+  }
+  return 0.09 - 0.038 * pow((t - 0.3) / 0.7, 1.5);
+}
+float baseR(float y) {
+  float t = clamp(y / BASE_TOP, 0.0, 1.0);
+  float r = mix(0.122, 0.074, t);
+  r += 0.005 * smoothstep(0.022, 0.012, y);
+  r += 0.0045 * smoothstep(0.955, 0.975, t);
+  return r;
+}
+float capR(float y) {
+  float t = clamp((y - CAP_BOTTOM) / (CAP_TOP - CAP_BOTTOM), 0.0, 1.0);
+  float r = mix(0.062, 0.037, t);
+  r += 0.0035 * smoothstep(0.1, 0.05, t);
+  if (y > CAP_TOP) {
+    float k = clamp((y - CAP_TOP) / 0.011, 0.0, 1.0);
+    r = 0.037 * sqrt(max(0.0, 1.0 - k * k));
+  }
+  return r;
 }
 `;
+
+// ---------------------------------------------------------------------------
+// 1. Smoke solver
+// ---------------------------------------------------------------------------
 
 export const SPLAT = `#version 300 es
 precision highp float;
@@ -46,27 +95,85 @@ void main() {
   p.x *= uAspect;
   float g = exp(-dot(p, p) / max(uRadius, 1e-6));
   vec4 base = texture(uTarget, vUv);
-  fragColor = base + vec4(uColor * g, g);
+  fragColor = base + vec4(uColor * g, 0.0);
 }
 `;
 
-export const VORTEX = `#version 300 es
+/** Adds smoke from up to 6 emitters and cools the temperature channel. */
+export const INJECT = `#version 300 es
 precision highp float;
 in vec2 vUv;
 out vec4 fragColor;
-uniform sampler2D uTarget;
-uniform vec2 uPoint;
-uniform float uStrength;
-uniform float uRadius;
+uniform sampler2D uDye;
+uniform vec4 uEmitA[6]; // x, y, radius, density/s
+uniform vec4 uEmitB[6]; // temp/s, vx, vy, 0
 uniform float uAspect;
+uniform float uDt;
 void main() {
-  vec2 d = vUv - uPoint;
-  d.x *= uAspect;
-  float g = exp(-dot(d, d) / max(uRadius, 1e-6));
-  vec2 tang = vec2(-d.y, d.x);
-  tang /= length(d) + 1e-5;
-  vec4 base = texture(uTarget, vUv);
-  fragColor = base + vec4(tang * (uStrength * g), 0.0, 0.0);
+  vec4 d = texture(uDye, vUv);
+  for (int i = 0; i < 6; i++) {
+    vec4 a = uEmitA[i];
+    if (a.z <= 0.0) continue;
+    vec2 p = vUv - a.xy;
+    p.x *= uAspect;
+    float g = exp(-dot(p, p) / a.z);
+    d.r += a.w * g * uDt;
+    d.g += uEmitB[i].x * g * uDt;
+  }
+  d.g *= exp(-0.12 * uDt);
+  d.r = min(d.r, 2.5);
+  d.g = min(d.g, 4.0);
+  fragColor = vec4(d.rg, 0.0, 1.0);
+}
+`;
+
+export const FORCES = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 fragColor;
+uniform sampler2D uVelocity;
+uniform sampler2D uDye;
+uniform vec4 uEmitA[6];
+uniform vec4 uEmitB[6];
+uniform float uAspect;
+uniform float uDt;
+uniform float uTime;
+uniform float uTurb;
+uniform float uBuoy;
+${NOISE}
+void main() {
+  vec2 vel = texture(uVelocity, vUv).xy;
+  vec2 dye = texture(uDye, vUv).rg;
+  // hot smoke rises, dense cool smoke settles a little
+  vel.y += (dye.g * uBuoy - dye.r * 6.0) * uDt;
+
+  for (int i = 0; i < 6; i++) {
+    vec4 a = uEmitA[i];
+    if (a.z <= 0.0) continue;
+    vec2 p = vUv - a.xy;
+    p.x *= uAspect;
+    float g = exp(-dot(p, p) / (a.z * 2.5));
+    vel += uEmitB[i].yz * g * uDt * 8.0;
+  }
+
+  // slow, evolving room draft: curl of 3D value noise (divergence-free)
+  vec3 q = vec3(vUv.x * uAspect * 2.2, vUv.y * 2.2, uTime * 0.045);
+  float e = 0.02;
+  float n1 = vnoise(q + vec3(0.0, e, 0.0)) + 0.5 * vnoise(q * 2.3 + vec3(0.0, e * 2.3, 7.0));
+  float n2 = vnoise(q - vec3(0.0, e, 0.0)) + 0.5 * vnoise(q * 2.3 - vec3(0.0, e * 2.3, -7.0));
+  float n3 = vnoise(q + vec3(e, 0.0, 0.0)) + 0.5 * vnoise(q * 2.3 + vec3(e * 2.3, 0.0, 7.0));
+  float n4 = vnoise(q - vec3(e, 0.0, 0.0)) + 0.5 * vnoise(q * 2.3 - vec3(e * 2.3, 0.0, -7.0));
+  vec2 curl = vec2(n1 - n2, -(n3 - n4)) / (2.0 * e);
+  vel += curl * uTurb * uDt;
+
+  vel *= exp(-0.12 * uDt);
+  // keep semi-Lagrangian steps short: fast hot jets otherwise alias into grit
+  float sp = length(vel);
+  if (sp > 90.0) vel *= 90.0 / sp;
+  float wall = smoothstep(0.0, 0.04, vUv.x) * smoothstep(0.0, 0.04, 1.0 - vUv.x) *
+               smoothstep(0.0, 0.008, vUv.y);
+  vel *= wall;
+  fragColor = vec4(vel, 0.0, 1.0);
 }
 `;
 
@@ -77,14 +184,12 @@ out vec4 fragColor;
 uniform sampler2D uVelocity;
 uniform sampler2D uSource;
 uniform vec2 uTexel;
-uniform vec2 uVelTexel;
 uniform float uDt;
 uniform float uDissipation;
-${BILERP}
 void main() {
-  vec2 vel = bilerp(uVelocity, vUv, uVelTexel).xy;
+  vec2 vel = texture(uVelocity, vUv).xy;
   vec2 coord = vUv - uDt * vel * uTexel;
-  fragColor = uDissipation * bilerp(uSource, clamp(coord, vec2(0.001), vec2(0.999)), uTexel);
+  fragColor = uDissipation * texture(uSource, coord);
 }
 `;
 
@@ -134,11 +239,11 @@ void main() {
   float T = texture(uCurl, vUv + vec2(0.0, uTexel.y)).x;
   float C = texture(uCurl, vUv).x;
   vec2 force = 0.5 * vec2(abs(T) - abs(B), abs(R) - abs(L));
-  float len = length(force) + 1e-5;
-  force = (force / len) * uCurlStrength * C;
+  force /= length(force) + 1e-5;
+  force *= uCurlStrength * C;
   force.y *= -1.0;
   vec2 vel = texture(uVelocity, vUv).xy + force * uDt;
-  fragColor = vec4(vel, 0.0, 1.0);
+  fragColor = vec4(clamp(vel, vec2(-1000.0), vec2(1000.0)), 0.0, 1.0);
 }
 `;
 
@@ -171,31 +276,12 @@ void main() {
   float R = texture(uPressure, vUv + vec2(uTexel.x, 0.0)).x;
   float B = texture(uPressure, vUv - vec2(0.0, uTexel.y)).x;
   float T = texture(uPressure, vUv + vec2(0.0, uTexel.y)).x;
-  vec2 vel = texture(uVelocity, vUv).xy;
-  vel -= vec2(R - L, T - B);
+  vec2 vel = texture(uVelocity, vUv).xy - vec2(R - L, T - B);
   fragColor = vec4(vel, 0.0, 1.0);
 }
 `;
 
-export const DIFFUSE = `#version 300 es
-precision highp float;
-in vec2 vUv;
-out vec4 fragColor;
-uniform sampler2D uTexture;
-uniform vec2 uTexel;
-uniform float uAlpha;
-uniform float uBeta;
-void main() {
-  vec4 L = texture(uTexture, vUv - vec2(uTexel.x, 0.0));
-  vec4 R = texture(uTexture, vUv + vec2(uTexel.x, 0.0));
-  vec4 B = texture(uTexture, vUv - vec2(0.0, uTexel.y));
-  vec4 T = texture(uTexture, vUv + vec2(0.0, uTexel.y));
-  vec4 C = texture(uTexture, vUv);
-  fragColor = (L + R + B + T + uAlpha * C) / uBeta;
-}
-`;
-
-export const CLEAR = `#version 300 es
+export const SCALE = `#version 300 es
 precision highp float;
 in vec2 vUv;
 out vec4 fragColor;
@@ -206,271 +292,352 @@ void main() {
 }
 `;
 
-export const THERMAL = `#version 300 es
+// ---------------------------------------------------------------------------
+// 2. Scene
+// ---------------------------------------------------------------------------
+
+/** Wall, table and smoke, lit by the lamp. Rendered at reduced resolution. */
+export const BACKDROP = `#version 300 es
 precision highp float;
 in vec2 vUv;
 out vec4 fragColor;
 uniform sampler2D uDye;
-uniform float uDt;
-uniform float uHeat;
-uniform float uChill;
-uniform float uBass;
-uniform float uDrive;
-uniform float uAspect;
-${GLASS}
+uniform vec3 uLight;
+uniform float uSmokeOn;
+${LAMP}
+${NOISE}
+float segDist(vec2 p, vec2 a, vec2 b) {
+  vec2 pa = p - a, ba = b - a;
+  float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+  return length(pa - ba * h);
+}
 void main() {
-  vec4 dye = texture(uDye, vUv);
-  float wax = dye.r;
-  float temp = dye.g;
-  float glass = insideGlass(vUv, uAspect);
-  float coil = exp(-pow((vUv.y - 0.075) / 0.065, 2.0));
-  coil *= smoothstep(0.14, 0.3, vUv.x) * smoothstep(0.86, 0.7, vUv.x);
-  float drive = uHeat * (0.7 + uBass * uDrive * 1.85);
-  temp += drive * coil * uDt * (0.45 + wax) * 9.0;
-  float cool = smoothstep(0.58, 0.94, vUv.y);
-  temp += (0.16 - temp) * uChill * (0.05 + cool * 2.4) * uDt * 2.4;
-  temp = clamp(temp, 0.0, 1.35);
-  wax = max(wax, 0.0) * glass;
-  fragColor = vec4(wax, temp * glass, 0.0, 1.0);
+  vec2 p = toLamp(vUv);
+  // the glowing glass acts as a vertical line light
+  float dl = segDist(p, vec2(0.0, 0.34), vec2(0.0, 0.78));
+  float fall = 1.0 / (1.0 + dl * dl * 9.0);
+
+  // back wall: dark plaster, warm pool of light around the lamp
+  float grain = vnoise(vec3(vUv * vec2(uAspect, 1.0) * 140.0, 0.0)) * 0.5 +
+                vnoise(vec3(vUv * vec2(uAspect, 1.0) * 23.0, 3.0)) * 0.5;
+  vec3 wall = vec3(0.010, 0.009, 0.010) * (1.0 + grain * 0.12);
+  wall += uLight * (0.016 + 0.2 * fall * fall) * (1.0 + grain * 0.05);
+  // soft shadow of the lamp body thrown up the wall behind it
+  float body = smoothstep(0.03, 0.15, abs(p.x)) ;
+  wall *= mix(0.55, 1.0, max(body, smoothstep(0.98, 1.2, p.y)));
+
+  // table: horizon slightly above the base footprint
+  float horizon = 0.06;
+  vec3 col = wall;
+  if (p.y < horizon) {
+    float depth = clamp((horizon - p.y) / 0.35, 0.0, 1.0);
+    vec3 table = vec3(0.016, 0.011, 0.008) * (0.8 + depth * 0.5);
+    float wood = vnoise(vec3(p.x * 3.0, p.y * 90.0 / (0.3 + depth), 1.0));
+    table *= 1.0 + wood * 0.18;
+    float pool = exp(-pow(p.x / (0.42 + depth * 0.3), 2.0) - pow((p.y - 0.01) / 0.07, 2.0));
+    table += uLight * pool * 0.16;
+    float contact = smoothstep(0.17, 0.1, length(vec2(p.x, (p.y - 0.004) * 3.2)));
+    table *= 1.0 - contact * 0.8;
+    float edge = smoothstep(0.004, 0.0, abs(p.y - horizon));
+    table += uLight * edge * 0.01;
+    col = mix(table, wall, smoothstep(horizon - 0.002, horizon + 0.002, p.y));
+  }
+
+  if (uSmokeOn > 0.5) {
+    float d = texture(uDye, vUv).r;
+    // march toward the lamp to fake self-shadowing
+    vec2 lp = toScreen(vec2(0.0, clamp(p.y, 0.36, 0.76)));
+    vec2 dir = lp - vUv;
+    float len = length(dir * vec2(uAspect, 1.0));
+    vec2 stepUv = dir / 6.0 * min(1.0, 0.3 / max(len, 1e-4));
+    float acc = 0.0;
+    vec2 s = vUv;
+    for (int i = 0; i < 6; i++) {
+      s += stepUv;
+      acc += texture(uDye, s).r;
+    }
+    float trans = exp(-acc * 0.55);
+    vec3 lit = uLight * (0.05 + 1.35 * fall) * trans;
+    vec3 amb = vec3(0.022, 0.024, 0.03);
+    float alpha = 1.0 - exp(-d * 1.4);
+    vec3 smoke = (amb + lit) * alpha;
+    col = col * (1.0 - alpha * 0.55) + smoke;
+  }
+  fragColor = vec4(col, 1.0);
 }
 `;
 
-export const FORCES = `#version 300 es
+export const LAMP_PASS = `#version 300 es
 precision highp float;
 in vec2 vUv;
 out vec4 fragColor;
-uniform sampler2D uVelocity;
-uniform sampler2D uDye;
-uniform float uDt;
-uniform float uRise;
-uniform float uCap;
-uniform float uBass;
-uniform float uDrive;
-uniform float uTime;
-uniform vec2 uDyeTexel;
-uniform float uAspect;
-${GLASS}
-void main() {
-  vec2 vel = texture(uVelocity, vUv).xy;
-  vec4 dye = texture(uDye, vUv);
-  float dense = smoothstep(0.28, 0.72, dye.r);
-  float temp = dye.g;
-  float glass = insideGlass(vUv, uAspect);
-  vec2 stepUv = uDyeTexel * 3.0;
-  float l = texture(uDye, vUv - vec2(stepUv.x, 0.0)).r;
-  float rgt = texture(uDye, vUv + vec2(stepUv.x, 0.0)).r;
-  float b = texture(uDye, vUv - vec2(0.0, stepUv.y)).r;
-  float t = texture(uDye, vUv + vec2(0.0, stepUv.y)).r;
-  vec2 grad = vec2(rgt - l, t - b);
-  vel += grad * 220.0 * uDt;
-  vel.y += (temp - 0.46) * dense * uRise * uDt;
-  vel.x -= (vUv.x - 0.5) * 3.5 * uDt;
-  vel.x += sin(vUv.y * 8.0 + uTime * 0.55) * dense * 16.0 * uDt;
-  vel.x += cos(uTime * 0.32 + vUv.y * 3.0) * 7.0 * uDt;
-  float coil = exp(-pow((vUv.y - 0.1) / 0.07, 2.0));
-  vel.y += uBass * uDrive * dense * 28.0 * coil * uDt;
-  float sp = length(vel);
-  if (sp > uCap) vel *= uCap / sp;
-  vel *= glass;
-  fragColor = vec4(vel, 0.0, 1.0);
-}
-`;
-
-export const SHARPEN = `#version 300 es
-precision highp float;
-in vec2 vUv;
-out vec4 fragColor;
-uniform sampler2D uDye;
-uniform vec2 uTexel;
-uniform float uAspect;
-${GLASS}
-void main() {
-  vec4 c = texture(uDye, vUv);
-  float w = c.r;
-  float l = texture(uDye, vUv - vec2(uTexel.x, 0.0)).r;
-  float rgt = texture(uDye, vUv + vec2(uTexel.x, 0.0)).r;
-  float b = texture(uDye, vUv - vec2(0.0, uTexel.y)).r;
-  float t = texture(uDye, vUv + vec2(0.0, uTexel.y)).r;
-  float avg = 0.25 * (l + rgt + b + t);
-  float sharpened = clamp(w + (w - avg) * 0.9, 0.0, 1.65);
-  float glass = insideGlass(vUv, uAspect);
-  float wax = mix(w, sharpened, 0.28) * glass;
-  fragColor = vec4(wax, c.g * glass, 0.0, 1.0);
-}
-`;
-
-export const SMOKE_FORCE = `#version 300 es
-precision highp float;
-in vec2 vUv;
-out vec4 fragColor;
-uniform sampler2D uVelocity;
-uniform sampler2D uDye;
-uniform float uDt;
-uniform float uBass;
-uniform float uTime;
-void main() {
-  vec2 vel = texture(uVelocity, vUv).xy;
-  float smoke = texture(uDye, vUv).r;
-  vel.y += smoke * (70.0 + uBass * 120.0) * uDt;
-  vel.x += sin(vUv.y * 5.0 + uTime * 0.35) * smoke * 36.0 * uDt;
-  vel.x += cos(uTime * 0.22 + vUv.y * 2.4) * smoke * 14.0 * uDt;
-  vel *= exp(-0.35 * uDt);
-  float sp = length(vel);
-  if (sp > 90.0) vel *= 90.0 / sp;
-  fragColor = vec4(vel, 0.0, 1.0);
-}
-`;
-
-export const DISPLAY = `#version 300 es
-precision highp float;
-in vec2 vUv;
-out vec4 fragColor;
-uniform sampler2D uDye;
-uniform vec2 uDyeTexel;
+uniform sampler2D uScene;
+uniform sampler2D uEnv;
 uniform vec2 uResolution;
 uniform float uTime;
 uniform float uGlow;
-uniform float uThreshold;
 uniform float uBass;
 uniform vec3 uCool;
 uniform vec3 uMid;
 uniform vec3 uHot;
 uniform vec3 uLiquid;
-uniform float uLampH;
-uniform float uLampAspect;
-uniform vec2 uLampCenter;
-uniform vec4 uBlobs[8];
-${BILERP}
+uniform vec3 uLight;
+uniform vec4 uBlobA[16];
+uniform vec4 uBlobB[16];
+${LAMP}
+const float PI = 3.14159265;
 
-float sdCapsule(vec2 p, float aspect) {
-  vec2 s = vec2(p.x, p.y * aspect);
-  float r = 0.47;
-  float halfLen = aspect * 0.5 - r;
-  vec2 pa = s - vec2(0.0, -halfLen);
-  vec2 ba = vec2(0.0, max(halfLen * 2.0, 0.001));
-  float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
-  return length(pa - ba * h) - r;
+vec3 env(vec3 d, float lod) {
+  float u = atan(d.x, -d.z) / (2.0 * PI) + 0.5 + 0.07;
+  float v = acos(clamp(d.y, -1.0, 1.0)) / PI;
+  vec3 c = textureLod(uEnv, vec2(u, v), lod).rgb;
+  c = pow(c, vec3(2.2));
+  // the env is an 8-bit tonemapped JPG: re-expand the strip lights to HDR
+  return c * 0.6 + pow(c, vec3(4.0)) * 7.0;
+}
+float fresnel(float cosT, float f0) {
+  return f0 + (1.0 - f0) * pow(1.0 - clamp(cosT, 0.0, 1.0), 5.0);
+}
+float bulb(float y) {
+  return exp(-(y - GLASS_BOTTOM) / 0.2) * (0.5 + uGlow * 1.2) * (1.0 + uBass * 0.7);
+}
+vec3 waxColor(float t) {
+  vec3 c = mix(uCool, uMid, smoothstep(0.2, 0.6, t));
+  return mix(c, uHot, smoothstep(0.6, 1.05, t));
+}
+// surface-of-revolution normal for radius R at height y with slope dR
+vec3 revNormal(float x, float R, float dR) {
+  float nx = clamp(x / max(R, 1e-4), -1.0, 1.0);
+  return normalize(vec3(nx, -dR, sqrt(max(0.0, 1.0 - nx * nx))));
 }
 
-float sdRoundBox(vec2 p, vec2 b, float r) {
-  vec2 q = abs(p) - b + vec2(r);
-  return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+vec3 metal(vec2 p, float R, float dR, vec3 tint, float rough) {
+  vec3 n = revNormal(p.x, R, dR);
+  vec3 r = reflect(vec3(0.0, 0.0, -1.0), n);
+  float brush = fract(sin(floor(p.y * 900.0) * 91.7) * 4375.5) - 0.5;
+  vec3 c = env(r, rough) * tint * (1.0 + brush * 0.1);
+  c += tint * 0.006;
+  return c * fresnel(n.z, 0.6);
 }
 
 void main() {
-  float screenAspect = uResolution.x / max(uResolution.y, 1.0);
-  float lampW = uLampH / uLampAspect / screenAspect;
-  vec2 p = (vUv - uLampCenter) / vec2(lampW, uLampH);
-  vec2 s = vec2(p.x, p.y * uLampAspect);
+  vec2 p = toLamp(vUv);
+  float px = 1.5 / (uLayout.z * uResolution.y);
+  vec3 col = texture(uScene, vUv).rgb;
+  float glow = (0.5 + uGlow * 1.2) * (1.0 + uBass * 0.7);
 
-  vec2 bgv = vUv - vec2(uLampCenter.x, uLampCenter.y - 0.04);
-  float vig = smoothstep(1.2, 0.12, length(bgv * vec2(screenAspect * 0.75, 1.0)));
-  vec3 room = mix(vec3(0.025, 0.016, 0.012), vec3(0.09, 0.045, 0.022), vig * 0.65);
-  float floorY = uLampCenter.y - uLampH * 0.58;
-  float floorGlow = exp(-pow((vUv.y - floorY) * 7.5, 2.0)) * exp(-pow((vUv.x - uLampCenter.x) * 2.6, 2.0));
-  room += uHot * floorGlow * (0.22 + uBass * 0.55) * uGlow;
+  // ---- glass, liquid and wax --------------------------------------------
+  if (p.y > GLASS_BOTTOM - 0.01 && p.y < GLASS_TOP + 0.01) {
+    float R = glassR(p.y);
+    float dR = (glassR(p.y + 0.002) - glassR(p.y - 0.002)) / 0.004;
+    float cover = clamp((R - abs(p.x)) / px, 0.0, 1.0);
+    if (cover > 0.0) {
+      vec3 n = revNormal(p.x, R, dR);
+      float nx = n.x;
+      float Rin = R * 0.955;
+      float b = bulb(p.y);
 
-  float d = sdCapsule(p, uLampAspect);
-  float aura = exp(-max(d, 0.0) * 14.0);
-  vec3 col = room + uHot * aura * 0.22 * uGlow;
+      // looking through a liquid-filled cylinder: the room behind is
+      // flipped, squeezed and split slightly by dispersion
+      vec2 base = vec2(-p.x * 0.42, p.y + 0.01);
+      vec3 through;
+      through.r = texture(uScene, toScreen(base + vec2(p.x * 0.03, 0.0))).r;
+      through.g = texture(uScene, toScreen(base)).g;
+      through.b = texture(uScene, toScreen(base - vec2(p.x * 0.03, 0.0))).b;
+      vec3 tint = mix(vec3(1.0), uLiquid * 3.0, 0.55);
+      vec3 inside = through * tint * 0.4;
+      // light from the bulb scattering in the liquid
+      float haze = b * (0.6 + 0.4 * (1.0 - abs(nx)));
+      inside += uLiquid * haze * 0.55 + uLight * haze * 0.05;
 
-  if (d < 0.03) {
-    float e = 0.006;
-    float dx = sdCapsule(p + vec2(e, 0.0), uLampAspect) - sdCapsule(p - vec2(e, 0.0), uLampAspect);
-    float dy = sdCapsule(p + vec2(0.0, e), uLampAspect) - sdCapsule(p - vec2(0.0, e), uLampAspect);
-    vec2 n = normalize(vec2(dx, dy) + 1e-4);
-    vec2 dyeUv = clamp(p + 0.5, 0.001, 0.999);
-    float nearWall = smoothstep(-0.22, -0.02, d);
-    dyeUv += n * 0.04 * nearWall;
-    dyeUv = clamp(dyeUv, 0.001, 0.999);
+      // wax: metaballs with elliptical, rotated kernels
+      if (abs(p.x) < Rin + px) {
+        float F = 0.0;
+        float Tw = 0.0;
+        vec2 g = vec2(0.0);
+        for (int i = 0; i < 16; i++) {
+          vec4 A = uBlobA[i];
+          if (A.z < 0.001) continue;
+          vec4 B = uBlobB[i];
+          vec2 d = p - A.xy;
+          float c = cos(B.y), s = sin(B.y);
+          vec2 q = vec2(c * d.x - s * d.y, s * d.x + c * d.y);
+          float sq = sqrt(B.x);
+          q.y /= sq;
+          q.x *= sq;
+          float Rk = A.z * 1.739;
+          float x = dot(q, q) / (Rk * Rk);
+          if (x >= 1.0) continue;
+          float k = 1.0 - x;
+          float f = k * k * k;
+          F += f;
+          Tw += f * A.w;
+          vec2 gq = -6.0 * k * k * vec2(q.x * sq, q.y / sq) / (Rk * Rk);
+          g += vec2(c * gq.x + s * gq.y, -s * gq.x + c * gq.y);
+        }
+        const float TH = 0.3;
+        float w = max(fwidth(F), 1e-4);
+        float edgeIn = clamp((Rin - abs(p.x)) / px, 0.0, 1.0);
+        float a = smoothstep(-w, w, F - TH) * edgeIn;
+        if (a > 0.0) {
+          float temp = Tw / max(F, 1e-4);
+          float h = clamp((F - TH) / 0.9, 0.0, 1.0);
+          vec3 wn = normalize(vec3(-g * 0.055, 1.0));
+          vec3 wc = waxColor(min(temp, 0.8));
+          // translucent: thin skin passes the bulb's light, the core holds it
+          float thick = sqrt(h);
+          vec3 L = normalize(vec3(-0.15, -0.85, 0.5));
+          float wrap = clamp((dot(wn, L) + 0.6) / 1.6, 0.0, 1.0);
+          vec3 trans = wc * mix(wc, uMid, 0.5) * 1.05 * exp(-thick * 2.6) * (0.3 + b * 0.75);
+          vec3 diff = wc * wrap * (0.18 + b * 0.9);
+          vec3 core = wc * 0.08 * (1.0 - thick * 0.6);
+          float rim = pow(1.0 - wn.z, 2.0);
+          vec3 sss = mix(uMid, uHot, 0.6) * rim * (0.25 + b * 0.8) * 0.8;
+          vec3 heat = wc * smoothstep(0.8, 1.15, temp) * 0.12 * glow;
+          vec3 spec = env(reflect(vec3(0.0, 0.0, -1.0), wn), 1.5) * fresnel(wn.z, 0.035) * 0.6;
+          vec3 waxCol = trans + diff + core + sss + heat + spec;
+          // warmer wax lights the liquid around it
+          inside = mix(inside, waxCol, a);
+        } else {
+          inside += uLight * smoothstep(0.0, TH, F) * 0.04 * b;
+        }
+      }
 
-    float field = 0.0;
-    float heatW = 0.0;
-    vec2 grad = vec2(0.0);
-    for (int i = 0; i < 8; i++) {
-      vec4 blob = uBlobs[i];
-      float rad = blob.z;
-      if (rad < 0.001) continue;
-      vec2 delta = vec2(dyeUv.x - blob.x, (dyeUv.y - blob.y) * uLampAspect);
-      float q = dot(delta, delta) / max(rad * rad, 1e-4);
-      float g = exp(-q);
-      field += g;
-      heatW += g * blob.w;
-      grad += g * delta / max(rad * rad, 1e-4);
+      // glass wall: thick at the silhouette, catches the bulb on its edges
+      float ax = abs(nx);
+      float wallBand = smoothstep(0.955, 0.99, ax);
+      inside *= 1.0 - smoothstep(0.82, 1.0, ax) * 0.45;
+      inside += uLight * wallBand * b * 0.55;
+      inside += uLiquid * wallBand * 0.15;
+
+      // reflections of the room (studio strip lights) on the curved glass
+      vec3 r = reflect(vec3(0.0, 0.0, -1.0), n);
+      float fr = fresnel(n.z, 0.04);
+      vec3 refl = env(r, 0.6);
+      inside += refl * (0.012 + fr * 0.9) * 0.38;
+
+      col = mix(col, inside, cover);
     }
-    float temp = clamp(heatW / max(field, 1e-4), 0.0, 1.2);
-    float body = smoothstep(0.42, 0.92, field);
-    float core = smoothstep(0.85, 2.1, field);
-    vec3 waxCol = mix(uCool, uMid, smoothstep(0.18, 0.55, temp));
-    waxCol = mix(waxCol, uHot, smoothstep(0.48, 0.95, temp));
-    float skin = body * (1.0 - core);
-    waxCol *= mix(1.35, 0.38, core);
-    waxCol += uHot * skin * (0.65 + uGlow * 0.85);
-    float shaft = exp(-pow((dyeUv.x - 0.44) * 2.2, 2.0)) * exp(-dyeUv.y * 1.45);
-    waxCol += mix(uMid, uHot, temp) * exp(-core * 1.7) * shaft * (0.45 + uGlow * 0.7);
-
-    float gradLen = length(grad);
-    vec2 outN = gradLen > 1e-3 ? -grad / gradLen : vec2(0.0, 1.0);
-    float specMask = smoothstep(0.04, 0.35, gradLen) * body;
-    float spec = pow(clamp(dot(outN, normalize(vec2(-0.58, 0.76))), 0.0, 1.0), 26.0);
-    waxCol += vec3(1.0, 0.96, 0.88) * spec * specMask * 0.95;
-    float spec2 = pow(clamp(dot(outN, normalize(vec2(0.7, 0.35))), 0.0, 1.0), 48.0);
-    waxCol += vec3(1.0, 0.98, 0.94) * spec2 * specMask * 0.45;
-
-    vec3 liquid = uLiquid * 0.22 + vec3(0.02, 0.01, 0.006);
-    liquid += uHot * shaft * (0.28 + uBass * 0.45) * uGlow;
-    liquid += uMid * 0.05 * (1.0 - dyeUv.y);
-    vec3 inside = mix(liquid, waxCol, clamp(body, 0.0, 0.9));
-
-    float shell = smoothstep(-0.08, -0.015, d) * (1.0 - smoothstep(-0.015, 0.02, d));
-    inside = mix(inside, inside * 0.55 + vec3(0.62, 0.7, 0.74), shell * 0.35);
-
-    float depth = smoothstep(-0.02, -0.28, d);
-    inside *= mix(0.62, 1.0, depth);
-
-    float streak = exp(-pow((p.x + 0.30) * 5.5, 2.0)) * smoothstep(-0.02, -0.2, d);
-    streak *= smoothstep(-0.42, 0.05, p.y) * smoothstep(0.46, 0.02, p.y);
-    inside += vec3(1.0, 0.97, 0.9) * streak * 0.45;
-
-    float rim = smoothstep(-0.02, 0.0, d) * (1.0 - smoothstep(0.0, 0.028, d));
-    inside += vec3(1.0, 0.96, 0.9) * rim;
-
-    col = mix(col, inside, 1.0 - smoothstep(-0.01, 0.025, d));
   }
 
-  float baseCy = -uLampAspect * 0.5 + 0.02;
-  float base = sdRoundBox(s - vec2(0.0, baseCy), vec2(0.58, 0.4), 0.14);
-  float capCy = uLampAspect * 0.5 - 0.01;
-  float cap = sdRoundBox(s - vec2(0.0, capCy), vec2(0.4, 0.2), 0.1);
+  // light leaking where the glass meets the base collar
+  float leak = exp(-pow((p.y - BASE_TOP - 0.004) / 0.0045, 2.0)) *
+               smoothstep(0.0, 0.002, glassR(p.y) - abs(p.x));
+  col += uLight * leak * glow * 0.9;
 
-  if (base < 0.0) {
-    float band = smoothstep(baseCy - 0.28, baseCy + 0.32, s.y);
-    vec3 metal = mix(vec3(0.05, 0.035, 0.028), vec3(0.42, 0.28, 0.14), band);
-    metal += vec3(1.0, 0.94, 0.82) * exp(-pow((s.x + 0.26) * 6.5, 2.0)) * 0.18;
-    float slit = exp(-pow((s.y - (baseCy + 0.16)) * 9.0, 2.0));
-    slit *= smoothstep(0.42, 0.08, abs(s.x));
-    metal += mix(uMid, uHot, 0.5 + 0.5 * uBass) * slit * (0.45 + uBass * 1.1) * uGlow;
-    float rim = smoothstep(0.0, -0.02, base) * smoothstep(-0.08, 0.0, base);
-    metal += vec3(0.85, 0.75, 0.55) * rim;
-    col = metal;
+  // ---- base -------------------------------------------------------------
+  if (p.y > -0.002 && p.y < BASE_TOP + 0.002) {
+    float R = baseR(p.y);
+    float dR = (baseR(p.y + 0.002) - baseR(max(0.0, p.y - 0.002))) / 0.004;
+    float cover = clamp((R - abs(p.x)) / px, 0.0, 1.0) *
+                  clamp((p.y + 0.001) / px, 0.0, 1.0) *
+                  clamp((BASE_TOP + 0.001 - p.y) / px, 0.0, 1.0);
+    if (cover > 0.0) {
+      vec3 m = metal(p, R, dR, vec3(0.34, 0.33, 0.33), 1.6);
+      // warm spill from the glass above onto the upper base
+      float up = smoothstep(BASE_TOP - 0.09, BASE_TOP, p.y);
+      m += uLight * up * up * 0.18 * glow * (1.0 - abs(p.x) / R * 0.5);
+      // seam rings
+      float seam = exp(-pow((p.y - 0.022) / 0.002, 2.0)) + exp(-pow((p.y - (BASE_TOP - 0.012)) / 0.0018, 2.0));
+      m *= 1.0 - seam * 0.5;
+      // ambient occlusion where it meets the table
+      m *= mix(0.35, 1.0, smoothstep(0.0, 0.05, p.y));
+      col = mix(col, m, cover);
+    }
   }
 
-  if (cap < 0.0) {
-    float band = smoothstep(capCy - 0.16, capCy + 0.16, s.y);
-    vec3 metal = mix(vec3(0.08, 0.06, 0.045), vec3(0.55, 0.4, 0.22), band);
-    metal += vec3(1.0, 0.95, 0.85) * exp(-pow((s.x + 0.20) * 8.0, 2.0)) * 0.22;
-    col = metal;
+  // ---- cap --------------------------------------------------------------
+  if (p.y > CAP_BOTTOM - 0.002 && p.y < CAP_TOP + 0.013) {
+    float R = capR(p.y);
+    float dR = (capR(p.y + 0.002) - capR(p.y - 0.002)) / 0.004;
+    float cover = clamp((R - abs(p.x)) / px, 0.0, 1.0) *
+                  clamp((p.y - CAP_BOTTOM + 0.001) / px, 0.0, 1.0);
+    if (cover > 0.0) {
+      vec3 m = metal(p, R, dR, vec3(0.34, 0.33, 0.33), 1.3);
+      float under = smoothstep(CAP_BOTTOM + 0.035, CAP_BOTTOM, p.y);
+      m += uLight * under * 0.16 * glow;
+      col = mix(col, m, cover);
+    }
   }
 
-  col = 1.0 - exp(-col * 1.08);
-  float hash = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
-  col += (hash - 0.5) * 0.004;
-  float glassA = 1.0 - smoothstep(-0.002, 0.01, d);
-  float hardware = max(1.0 - smoothstep(0.0, 0.016, base), 1.0 - smoothstep(0.0, 0.016, cap));
-  float body = max(glassA, hardware);
-  float auraA = aura * 0.4;
-  float alpha = max(body, max(auraA, floorGlow * 0.35));
-  vec3 glowCol = uHot * (aura * 0.28 + floorGlow * 0.45) * uGlow;
-  fragColor = vec4(mix(glowCol, col, body), alpha);
+  fragColor = vec4(col, 1.0);
+}
+`;
+
+export const BLOOM_PREFILTER = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 fragColor;
+uniform sampler2D uTexture;
+uniform vec2 uTexel;
+uniform float uThreshold;
+void main() {
+  vec3 c = texture(uTexture, vUv + uTexel * vec2(-0.5, -0.5)).rgb +
+           texture(uTexture, vUv + uTexel * vec2(0.5, -0.5)).rgb +
+           texture(uTexture, vUv + uTexel * vec2(-0.5, 0.5)).rgb +
+           texture(uTexture, vUv + uTexel * vec2(0.5, 0.5)).rgb;
+  c *= 0.25;
+  float br = max(c.r, max(c.g, c.b));
+  float soft = clamp(br - uThreshold + 0.25, 0.0, 0.5);
+  soft = soft * soft / 0.5;
+  float w = max(soft, br - uThreshold) / max(br, 1e-4);
+  fragColor = vec4(c * w, 1.0);
+}
+`;
+
+export const BLUR = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 fragColor;
+uniform sampler2D uTexture;
+uniform vec2 uDir;
+void main() {
+  vec3 c = texture(uTexture, vUv).rgb * 0.227027;
+  c += texture(uTexture, vUv + uDir * 1.384615).rgb * 0.316216;
+  c += texture(uTexture, vUv - uDir * 1.384615).rgb * 0.316216;
+  c += texture(uTexture, vUv + uDir * 3.230769).rgb * 0.070270;
+  c += texture(uTexture, vUv - uDir * 3.230769).rgb * 0.070270;
+  fragColor = vec4(c, 1.0);
+}
+`;
+
+// ---------------------------------------------------------------------------
+// 3. Final
+// ---------------------------------------------------------------------------
+
+export const FINAL = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 fragColor;
+uniform sampler2D uComp;
+uniform sampler2D uBloomA;
+uniform sampler2D uBloomB;
+uniform sampler2D uNoise;
+uniform vec2 uNoiseOffset;
+uniform float uBloom;
+uniform float uExposure;
+${LAMP}
+vec3 aces(vec3 x) {
+  return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+void main() {
+  vec3 col = texture(uComp, vUv).rgb;
+  vec2 p = toLamp(vUv);
+  // glossy table: mirrored, blurred lamp below the footprint line
+  if (p.y < 0.0) {
+    vec2 m = toScreen(vec2(p.x, -p.y));
+    float fade = exp(p.y * 9.0) * smoothstep(0.3, 0.1, abs(p.x));
+    vec3 refl = texture(uComp, m).rgb * 0.5 + texture(uBloomA, m).rgb * 2.0;
+    col += refl * fade * 0.13;
+  }
+  vec3 bloom = texture(uBloomA, vUv).rgb * 0.55 + texture(uBloomB, vUv).rgb * 0.85;
+  col += bloom * uBloom;
+  col = aces(col * uExposure);
+  vec2 v = vUv - 0.5;
+  col *= 1.0 - dot(v * vec2(1.1, 0.9), v * vec2(1.1, 0.9)) * 0.55;
+  col = pow(col, vec3(1.0 / 2.2));
+  float n = texture(uNoise, gl_FragCoord.xy / 128.0 + uNoiseOffset).r;
+  col += (n - 0.5) * (1.6 / 255.0 + 0.018 * (1.0 - col.g));
+  fragColor = vec4(col, 1.0);
 }
 `;
