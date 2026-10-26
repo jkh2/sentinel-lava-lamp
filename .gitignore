@@ -11,3 +11,5 @@ attachments
 .vercel
 *.log
 .DS_Store
+.grok/preview.log
+.grok/preview.pid
