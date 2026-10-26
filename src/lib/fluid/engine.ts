@@ -19,8 +19,18 @@ export interface LampParams {
   chill: number;
   glow: number;
   drive: number;
+  /** How far the music may swing the light's color around the wheel (0–1). */
+  hue: number;
   paused: boolean;
   palette: Palette;
+}
+
+/** Live analysis of the playing track; `live` is false when nothing is analysable. */
+export interface MusicState {
+  bass: number;
+  mid: number;
+  treble: number;
+  live: boolean;
 }
 
 interface FBO {
@@ -130,6 +140,23 @@ function hash(n: number) {
   const s = Math.sin(n * 127.1) * 43758.5453;
   return s - Math.floor(s);
 }
+/** Rotate an RGB color around the grey axis by `turns` of the color wheel. */
+function hueRotate(c: [number, number, number], turns: number): [number, number, number] {
+  const a = turns * Math.PI * 2;
+  const ca = Math.cos(a);
+  const sa = Math.sin(a);
+  const k = 0.57735027;
+  const dot = (c[0] + c[1] + c[2]) * k;
+  const cross: [number, number, number] = [
+    k * (c[2] - c[1]),
+    k * (c[0] - c[2]),
+    k * (c[1] - c[0]),
+  ];
+  return [0, 1, 2].map((i) =>
+    Math.max(0, (c[i] ?? 0) * ca + (cross[i] ?? 0) * sa + k * dot * (1 - ca)),
+  ) as [number, number, number];
+}
+
 /** Smooth, non-repeating 1D value noise in [-1, 1]. */
 function noise1(t: number) {
   const i = Math.floor(t);
@@ -144,6 +171,7 @@ export class LampEngine {
   readonly canvas: HTMLCanvasElement;
   params: LampParams;
   bass = 0;
+  music: MusicState = { bass: 0, mid: 0, treble: 0, live: false };
   time = 0;
   destroyed = false;
   private gl: WebGL2RenderingContext;
@@ -190,6 +218,12 @@ export class LampEngine {
   private fastFor = 0;
   private emitA = new Float32Array(EMITTERS * 4);
   private emitB = new Float32Array(EMITTERS * 4);
+  /** Current color-wheel offset of the light (turns), driven by the music. */
+  private hue = 0;
+  /** Beat flash, decays over a fraction of a second. */
+  private flash = 0;
+  private prevMusicBass = 0;
+  private energy = 0;
   private readonly smokeOn: boolean;
 
   constructor(canvas: HTMLCanvasElement, params: LampParams) {
@@ -425,7 +459,8 @@ export class LampEngine {
     gl.uniform1f(p.uniforms.uAspect, this.aspect());
   }
 
-  private lightColor(): [number, number, number] {
+  /** The palette's own lamp light, before the music recolors it. */
+  private baseLight(): [number, number, number] {
     const pal = this.params.palette;
     const k = (0.5 + this.params.glow * 1.2) * (1 + this.bass * this.params.drive * 0.7);
     return [
@@ -433,6 +468,47 @@ export class LampEngine {
       (pal.mid[1] * 0.55 + pal.hot[1] * 0.45) * k,
       (pal.mid[2] * 0.55 + pal.hot[2] * 0.45) * k,
     ];
+  }
+
+  private lightColor(): [number, number, number] {
+    const base = this.baseLight();
+    const c = hueRotate(base, this.hue);
+    // keep perceived brightness steady through the rotation, then flash on beats
+    const lum = (v: [number, number, number]) => v[0] * 0.2126 + v[1] * 0.7152 + v[2] * 0.0722;
+    const keep = lum(base) / Math.max(1e-4, lum(c));
+    const fix = Math.min(1.6, Math.max(0.6, keep));
+    const f = 1 + this.flash * 0.4;
+    return [c[0] * fix * f, c[1] * fix * f, c[2] * fix * f];
+  }
+
+  /**
+   * Music → color and energy. Bass-heavy passages keep the palette's color;
+   * as mids and highs take over the light swings around the wheel (by up to
+   * `hue` × 0.42 turns). Smoothed so it flows instead of flickering.
+   */
+  private updateMusic(dt: number) {
+    const m = this.music;
+    const amount = this.params.hue;
+    let target = 0;
+    if (m.live) {
+      const total = m.bass + m.mid + m.treble + 0.05;
+      const bright = (m.mid * 0.55 + m.treble * 1.0) / total;
+      const shift = Math.min(1, Math.max(0, (bright - 0.18) / 0.5));
+      const level = Math.min(1, total / 1.2);
+      // a slow drift so long, even passages still breathe in color
+      const drift = noise1(this.time * 0.05 + 7.7) * 0.12 * level;
+      // negative turns: warm lamps swing through rose and magenta toward violet
+      target = -(shift * 0.42 + drift) * amount;
+      const onset = Math.max(0, m.bass - this.prevMusicBass);
+      if (onset > 0.04) this.flash = Math.max(this.flash, Math.min(1, onset * 4) * this.params.drive);
+      this.energy += (level - this.energy) * Math.min(1, dt * 3);
+    } else {
+      this.energy += (0 - this.energy) * Math.min(1, dt * 1.5);
+    }
+    this.prevMusicBass = m.bass;
+    const rate = m.live ? 1.4 : 0.6;
+    this.hue += (target - this.hue) * Math.min(1, dt * rate);
+    this.flash *= Math.exp(-dt * 5);
   }
 
   // ---- public API ---------------------------------------------------------
@@ -466,7 +542,8 @@ export class LampEngine {
     this.blit(this.velocity.write);
     this.velocity.swap();
     this.bind(0, this.dye.read.texture);
-    gl.uniform3f(sp.uniforms.uColor, Math.min(0.1, Math.hypot(du, dv) * 3), 0.03, 0);
+    const amount = Math.min(0.1, Math.hypot(du, dv) * 3);
+    gl.uniform3f(sp.uniforms.uColor, amount, 0.03, amount * this.hue);
     gl.uniform1f(sp.uniforms.uRadius, 0.0016);
     this.blit(this.dye.write);
     this.dye.swap();
@@ -479,6 +556,7 @@ export class LampEngine {
     this.govern(dt);
     if (!this.params.paused) {
       this.time += t;
+      this.updateMusic(t);
       const p = this.params;
       this.gobs.update(t, {
         heat: p.heat,
@@ -500,6 +578,7 @@ export class LampEngine {
     const p = this.params;
     for (let t = 0; t < seconds; t += 1 / 30) {
       this.time += 1 / 30;
+      this.updateMusic(1 / 30);
       this.gobs.update(1 / 30, {
         heat: p.heat,
         rise: p.rise,
@@ -572,7 +651,11 @@ export class LampEngine {
       const x = lane + 0.1 * noise1(t * 0.03 + i * 37.7);
       // bursty: mostly quiet, then a soft swell of smoke
       const swell = noise1(t * 0.16 + i * 11.3) * 1.25 + 0.15;
-      const puff = Math.max(0, swell) ** 1.5;
+      // music: bass swells every source, beats push out a burst
+      const music = this.music.live
+        ? this.music.bass * this.params.drive * 0.9 + this.flash * 1.1
+        : 0;
+      const puff = Math.max(0, swell) ** 1.5 + music;
       a[o] = Math.min(0.9, Math.max(0.1, x));
       a[o + 1] = 0.03;
       a[o + 2] = 0.0035 + 0.0025 * (noise1(t * 0.07 + i * 5.1) * 0.5 + 0.5);
@@ -580,6 +663,7 @@ export class LampEngine {
       b[o] = 1.2 * puff;
       b[o + 1] = noise1(t * 0.2 + i * 3.3) * 8;
       b[o + 2] = 10 + puff * 10;
+      b[o + 3] = this.hue; // color tag: smoke remembers the light it was born in
     }
     // warm air off the cap: a thin, hot plume that pulses with the bass
     const aspect = this.aspect();
@@ -592,6 +676,7 @@ export class LampEngine {
     b[o] = 0.9 + bass * 1.4;
     b[o + 1] = noise1(t * 0.5 + 9) * 6;
     b[o + 2] = 14 + bass * 20;
+    b[o + 3] = this.hue;
   }
 
   private simulate(dt: number) {
@@ -624,7 +709,8 @@ export class LampEngine {
     gl.uniform1f(f.uniforms.uAspect, aspect);
     gl.uniform1f(f.uniforms.uDt, dt);
     gl.uniform1f(f.uniforms.uTime, this.time);
-    gl.uniform1f(f.uniforms.uTurb, 0.9 + this.params.swirl * 1.8);
+    const treble = this.music.live ? this.music.treble * this.params.drive : 0;
+    gl.uniform1f(f.uniforms.uTurb, 0.9 + this.params.swirl * 1.8 + treble * 2.2);
     gl.uniform1f(f.uniforms.uBuoy, 24);
     this.blit(vel.write);
     vel.swap();
@@ -719,6 +805,9 @@ export class LampEngine {
     if (this.dye) this.bind(0, this.dye.read.texture);
     gl.uniform1i(bd.uniforms.uDye, 0);
     gl.uniform3f(bd.uniforms.uLight, light[0], light[1], light[2]);
+    const base = this.baseLight();
+    gl.uniform3f(bd.uniforms.uLightBase, base[0], base[1], base[2]);
+    gl.uniform1f(bd.uniforms.uTagMix, Math.min(1, this.params.hue * 1.2));
     gl.uniform1f(bd.uniforms.uSmokeOn, this.smokeOn ? 1 : 0);
     this.blit(this.scene);
 

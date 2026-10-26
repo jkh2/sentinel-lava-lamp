@@ -9,6 +9,8 @@ export interface LampSettings {
   chill: number;
   glow: number;
   drive: number;
+  /** How much the music recolors the light and smoke (0 = lamp color only). */
+  hue: number;
   palette: PaletteId;
   volume: number;
   paused: boolean;
@@ -24,6 +26,7 @@ export const DEFAULT_SETTINGS: LampSettings = {
   chill: 0.3,
   glow: 0.25,
   drive: 0.86,
+  hue: 0.6,
   palette: "amber",
   volume: 0.84,
   paused: false,

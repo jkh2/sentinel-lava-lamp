@@ -63,8 +63,16 @@ export function LampExperience() {
     engineRef.current = engine;
     if (import.meta.env.DEV) {
       // QA hook: fast-forward the physics without rendering every step.
-      (window as unknown as { __lampAdvance?: (s: number) => void }).__lampAdvance = (s) =>
-        engine.advance(s);
+      const w = window as unknown as {
+        __lampAdvance?: (s: number) => void;
+        __lampTrackTime?: () => number;
+        __lampSeek?: (t: number) => void;
+      };
+      w.__lampAdvance = (s) => engine.advance(s);
+      w.__lampTrackTime = () => (rig.audio.paused ? -1 : rig.audio.currentTime);
+      w.__lampSeek = (t) => {
+        rig.audio.currentTime = t;
+      };
     }
 
     let paletteId = settingsRef.current.palette;
@@ -89,9 +97,16 @@ export function LampExperience() {
       p.chill = current.chill;
       p.glow = current.glow;
       p.drive = current.drive;
+      p.hue = current.hue;
       p.paused = current.paused;
       p.palette = palette;
       engine.bass = rig.bass;
+      // Only an uploaded file can be analysed; YouTube audio is out of reach.
+      const m = engine.music;
+      m.live = rig.mode === "file" && !rig.audio.paused;
+      m.bass = rig.bass;
+      m.mid = rig.mid;
+      m.treble = rig.treble;
       engine.step(dt);
       raf = requestAnimationFrame(loop);
     };

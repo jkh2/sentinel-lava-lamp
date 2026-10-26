@@ -106,10 +106,11 @@ in vec2 vUv;
 out vec4 fragColor;
 uniform sampler2D uDye;
 uniform vec4 uEmitA[6]; // x, y, radius, density/s
-uniform vec4 uEmitB[6]; // temp/s, vx, vy, 0
+uniform vec4 uEmitB[6]; // temp/s, vx, vy, color tag (hue turns)
 uniform float uAspect;
 uniform float uDt;
 void main() {
+  // .r density, .g temperature, .b density × color tag (so b/r is the tag)
   vec4 d = texture(uDye, vUv);
   for (int i = 0; i < 6; i++) {
     vec4 a = uEmitA[i];
@@ -117,13 +118,18 @@ void main() {
     vec2 p = vUv - a.xy;
     p.x *= uAspect;
     float g = exp(-dot(p, p) / a.z);
-    d.r += a.w * g * uDt;
+    float add = a.w * g * uDt;
+    d.r += add;
+    d.b += add * uEmitB[i].w;
     d.g += uEmitB[i].x * g * uDt;
   }
   d.g *= exp(-0.12 * uDt);
-  d.r = min(d.r, 2.5);
+  if (d.r > 2.5) {
+    d.b *= 2.5 / d.r;
+    d.r = 2.5;
+  }
   d.g = min(d.g, 4.0);
-  fragColor = vec4(d.rg, 0.0, 1.0);
+  fragColor = vec4(d.rgb, 1.0);
 }
 `;
 
@@ -303,9 +309,17 @@ in vec2 vUv;
 out vec4 fragColor;
 uniform sampler2D uDye;
 uniform vec3 uLight;
+uniform vec3 uLightBase;
+uniform float uTagMix;
 uniform float uSmokeOn;
 ${LAMP}
 ${NOISE}
+vec3 hueRotate(vec3 c, float turns) {
+  float a = turns * 6.2831853;
+  vec3 k = vec3(0.57735027);
+  float ca = cos(a);
+  return max(c * ca + cross(k, c) * sin(a) + k * dot(k, c) * (1.0 - ca), vec3(0.0));
+}
 float segDist(vec2 p, vec2 a, vec2 b) {
   vec2 pa = p - a, ba = b - a;
   float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
@@ -344,7 +358,15 @@ void main() {
   }
 
   if (uSmokeOn > 0.5) {
-    float d = texture(uDye, vUv).r;
+    vec3 dye = texture(uDye, vUv).rgb;
+    float d = dye.r;
+    // each puff keeps the color of the light it was released under
+    float tag = dye.b / max(dye.r, 0.02);
+    vec3 born = hueRotate(uLightBase, tag);
+    float lb = dot(uLightBase, vec3(0.2126, 0.7152, 0.0722));
+    float lr = dot(born, vec3(0.2126, 0.7152, 0.0722));
+    born *= clamp(lb / max(lr, 1e-4), 0.6, 1.6);
+    vec3 smokeLight = mix(uLight, born, uTagMix * 0.7);
     // march toward the lamp to fake self-shadowing
     vec2 lp = toScreen(vec2(0.0, clamp(p.y, 0.36, 0.76)));
     vec2 dir = lp - vUv;
@@ -359,7 +381,7 @@ void main() {
     }
     // optical depth toward the lamp, scaled by how far we actually marched
     float shadow = mix(0.4, 1.0, exp(-acc * (reach / 0.3) * 0.45));
-    vec3 lit = uLight * (0.05 + 1.35 * fall) * shadow;
+    vec3 lit = smokeLight * (0.05 + 1.35 * fall) * shadow;
     // multiple scattering: thick smoke takes on the room's own light, so a
     // dense knot reads as a lit billow, never as a dark stain
     vec3 scatter = col * 1.5 + vec3(0.02, 0.022, 0.027);

@@ -137,6 +137,14 @@ export function TunePanel({
         high="kick"
         onChange={(drive) => onChange({ drive })}
       />
+      <Slider
+        label="Music color"
+        value={settings.hue}
+        low="lamp only"
+        mid="tinted"
+        high="light show"
+        onChange={(hue) => onChange({ hue })}
+      />
       <div className="tune-actions">
         <button type="button" className="btn grow" onClick={onReheat}>
           <RotateCcw size={16} aria-hidden />
