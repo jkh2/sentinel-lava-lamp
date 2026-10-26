@@ -98,11 +98,31 @@ export class ListeningRig {
   mid = 0;
   treble = 0;
   level = 0;
+  /** Dominant note as a MIDI number (from a chromagram), or -1 when none is clear. */
+  noteMidi = -1;
+  /** How clearly one pitch class dominates, 0–1. */
+  noteStrength = 0;
+  /** Increments on every detected note onset (spectral flux peak). */
+  onsets = 0;
+  /** Strength of the most recent onset, 0–1. */
+  onsetStrength = 0;
   volume = 0.85;
   onChange: () => void = () => {};
   private ctx: AudioContext | null = null;
   private analyser: AnalyserNode | null = null;
   private freq = new Uint8Array(0);
+  /** A finer, parallel analyser for pitch: 8192-point FFT ≈ 5 Hz bins. */
+  private pitchAnalyser: AnalyserNode | null = null;
+  private spec = new Float32Array(0);
+  private prevMag = new Float32Array(0);
+  private binPc = new Int8Array(0);
+  private binMidi = new Float32Array(0);
+  private binLo = 0;
+  private binHi = 0;
+  private chroma = new Float32Array(12);
+  private fluxMean = 0;
+  private fluxVar = 0;
+  private lastOnset = 0;
   private source: MediaElementAudioSourceNode | null = null;
   private yt: YTPlayer | null = null;
   private objectUrl = "";
@@ -133,6 +153,26 @@ export class ListeningRig {
       this.source = this.ctx.createMediaElementSource(this.audio);
       this.source.connect(this.analyser);
       this.analyser.connect(this.ctx.destination);
+      // pitch analyser: listens only, not connected to the output
+      const pa = this.ctx.createAnalyser();
+      pa.fftSize = 8192;
+      pa.smoothingTimeConstant = 0.45;
+      this.source.connect(pa);
+      this.pitchAnalyser = pa;
+      const bins = pa.frequencyBinCount;
+      const hz = this.ctx.sampleRate / pa.fftSize;
+      this.spec = new Float32Array(bins);
+      this.prevMag = new Float32Array(bins);
+      this.binPc = new Int8Array(bins);
+      this.binMidi = new Float32Array(bins);
+      this.binLo = Math.max(1, Math.floor(65 / hz));
+      this.binHi = Math.min(bins - 1, Math.ceil(4200 / hz));
+      for (let i = 0; i < bins; i++) {
+        const f = i * hz;
+        const midi = f > 0 ? 69 + 12 * Math.log2(f / 440) : 0;
+        this.binMidi[i] = midi;
+        this.binPc[i] = ((Math.round(midi) % 12) + 12) % 12;
+      }
     }
     if (this.ctx.state === "suspended") await this.ctx.resume();
   }
@@ -291,8 +331,11 @@ export class ListeningRig {
       this.mid += (idle * 0.4 - this.mid) * 0.08;
       this.treble += (0 - this.treble) * 0.08;
       this.level = this.bass;
+      this.noteStrength += (0 - this.noteStrength) * 0.1;
+      if (this.noteStrength < 0.05) this.noteMidi = -1;
       return;
     }
+    this.samplePitch();
     this.analyser.getByteFrequencyData(this.freq);
     const n = this.freq.length;
     const avg = (a: number, b: number) => {
@@ -309,6 +352,68 @@ export class ListeningRig {
     this.mid += (mid - this.mid) * 0.28;
     this.treble += (treble - this.treble) * 0.22;
     this.level = Math.min(1, this.bass * 0.72 + this.mid * 0.28);
+  }
+
+  /**
+   * Chromagram + spectral-flux onsets. Polyphonic music has no single pitch,
+   * so instead of chasing one frequency we fold the spectrum into the 12
+   * pitch classes and take the one that dominates, plus an onset whenever the
+   * spectrum suddenly gains energy (a note or chord is struck).
+   */
+  private samplePitch() {
+    const pa = this.pitchAnalyser;
+    if (!pa) return;
+    pa.getFloatFrequencyData(this.spec);
+    const chroma = this.chroma;
+    chroma.fill(0);
+    let flux = 0;
+    let total = 0;
+    for (let i = this.binLo; i <= this.binHi; i++) {
+      const db = this.spec[i] ?? -200;
+      const mag = db > -110 ? Math.pow(10, db / 20) : 0;
+      const prev = this.prevMag[i] ?? 0;
+      if (mag > prev) flux += mag - prev;
+      this.prevMag[i] = mag;
+      const e = mag * mag;
+      total += e;
+      const pc = this.binPc[i] ?? 0;
+      chroma[pc] = (chroma[pc] ?? 0) + e;
+    }
+    let best = 0;
+    for (let k = 1; k < 12; k++) if ((chroma[k] ?? 0) > (chroma[best] ?? 0)) best = k;
+    const share = total > 1e-9 ? (chroma[best] ?? 0) / total : 0;
+    // 1/12 ≈ 0.083 is noise; a clean note or simple chord sits well above
+    const strength = total > 1e-7 ? Math.min(1, Math.max(0, (share - 0.14) / 0.32)) : 0;
+    this.noteStrength += (strength - this.noteStrength) * 0.35;
+    if (strength > 0.12) {
+      // octave: energy-weighted pitch of the bins in the winning class
+      let wsum = 0;
+      let msum = 0;
+      for (let i = this.binLo; i <= this.binHi; i++) {
+        if (this.binPc[i] !== best) continue;
+        const m = this.prevMag[i] ?? 0;
+        const w = m * m;
+        wsum += w;
+        msum += w * (this.binMidi[i] ?? 0);
+      }
+      const centre = wsum > 0 ? msum / wsum : 60;
+      const octave = Math.round((centre - best) / 12);
+      this.noteMidi = best + octave * 12;
+    } else if (this.noteStrength < 0.05) {
+      this.noteMidi = -1;
+    }
+    // adaptive onset threshold on the flux
+    const now = performance.now() / 1000;
+    const std = Math.sqrt(Math.max(0, this.fluxVar));
+    const hit = flux > this.fluxMean + std * 2.2 + 0.002 && now - this.lastOnset > 0.11;
+    if (hit) {
+      this.onsets += 1;
+      this.lastOnset = now;
+      this.onsetStrength = Math.min(1, (flux - this.fluxMean) / (std * 6 + 0.01));
+    }
+    const d = flux - this.fluxMean;
+    this.fluxMean += d * 0.05;
+    this.fluxVar += (d * d - this.fluxVar) * 0.05;
   }
 
   bars(): number[] {

@@ -67,9 +67,11 @@ export function LampExperience() {
         __lampAdvance?: (s: number) => void;
         __lampTrackTime?: () => number;
         __lampSeek?: (t: number) => void;
+        __lampNote?: () => { midi: number; strength: number; onsets: number; bass: number; mid: number };
       };
       w.__lampAdvance = (s) => engine.advance(s);
       w.__lampTrackTime = () => (rig.audio.paused ? -1 : rig.audio.currentTime);
+      w.__lampNote = () => ({ midi: rig.noteMidi, strength: rig.noteStrength, onsets: rig.onsets, bass: rig.bass, mid: rig.mid });
       w.__lampSeek = (t) => {
         rig.audio.currentTime = t;
       };
@@ -98,6 +100,7 @@ export function LampExperience() {
       p.glow = current.glow;
       p.drive = current.drive;
       p.hue = current.hue;
+      p.cymatics = current.cymatics;
       p.paused = current.paused;
       p.palette = palette;
       engine.bass = rig.bass;
@@ -107,6 +110,10 @@ export function LampExperience() {
       m.bass = rig.bass;
       m.mid = rig.mid;
       m.treble = rig.treble;
+      m.noteMidi = rig.noteMidi;
+      m.noteStrength = rig.noteStrength;
+      m.onsets = rig.onsets;
+      m.onsetStrength = rig.onsetStrength;
       engine.step(dt);
       raf = requestAnimationFrame(loop);
     };

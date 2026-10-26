@@ -34,6 +34,40 @@ float vnoise(vec3 x) {
 }
 `;
 
+/**
+ * The room as a Chladni plate (figure function from Cymatic Cosmos). Up to
+ * three ringing modes are summed; their nodal lines (field = 0) are where
+ * the smoke gathers, like sand on a bowed plate. Needs uAspect declared.
+ */
+const CYMATIC = `
+uniform vec4 uModes[3]; // n, m, signed amplitude, rotation
+uniform vec3 uPlate;    // centre uv, radius in screen heights
+uniform float uSpread;  // plate radii before the figure fades out
+uniform float uCym;     // overall strength (slider)
+float chladni(vec2 q, float n, float m, float s) {
+  const float PI = 3.14159265;
+  return cos(n * PI * q.x) * cos(m * PI * q.y) + s * cos(m * PI * q.x) * cos(n * PI * q.y);
+}
+float plateField(vec2 uv, out float mask, out float energy) {
+  vec2 d = uv - uPlate.xy;
+  d.x *= uAspect;
+  vec2 q0 = d / uPlate.z;
+  float x = clamp(length(q0) / uSpread, 0.0, 1.0);
+  mask = (1.0 - x * x) * (1.0 - x * x);
+  float phi = 0.0;
+  energy = 0.0;
+  for (int i = 0; i < 3; i++) {
+    vec4 M = uModes[i];
+    if (M.z == 0.0) continue;
+    float c = cos(M.w), s = sin(M.w);
+    vec2 q = vec2(c * q0.x - s * q0.y, s * q0.x + c * q0.y);
+    phi += abs(M.z) * chladni(q, M.x, M.y, sign(M.z));
+    energy += abs(M.z);
+  }
+  return phi;
+}
+`;
+
 /** Exact mirror of src/lib/lamp/geometry.ts. */
 const LAMP = `
 const float BASE_TOP = 0.29;
@@ -109,9 +143,22 @@ uniform vec4 uEmitA[6]; // x, y, radius, density/s
 uniform vec4 uEmitB[6]; // temp/s, vx, vy, color tag (hue turns)
 uniform float uAspect;
 uniform float uDt;
+uniform float uTag;
+${CYMATIC}
 void main() {
   // .r density, .g temperature, .b density × color tag (so b/r is the tag)
   vec4 d = texture(uDye, vUv);
+  // a ringing note draws its figure faintly into the air along the nodal lines
+  float mask, energy;
+  float phi = plateField(vUv, mask, energy);
+  if (energy > 0.0) {
+    float w = fwidth(phi) * 2.6 + 0.09 * energy;
+    float line = 1.0 - smoothstep(0.0, w, abs(phi));
+    float room = 1.0 - smoothstep(0.25, 0.9, d.r);
+    float press = line * line * mask * room * min(energy, 1.2) * uCym * 0.4 * uDt;
+    d.r += press;
+    d.b += press * uTag;
+  }
   for (int i = 0; i < 6; i++) {
     vec4 a = uEmitA[i];
     if (a.z <= 0.0) continue;
@@ -146,9 +193,25 @@ uniform float uDt;
 uniform float uTime;
 uniform float uTurb;
 uniform float uBuoy;
+uniform vec2 uTexel;
 ${NOISE}
+${CYMATIC}
 void main() {
   vec2 vel = texture(uVelocity, vUv).xy;
+  // Standing wave: push the smoke off the vibrating antinodes onto the still
+  // nodal lines, i.e. down the gradient of field² (as sand moves on a plate).
+  float mask, energy;
+  float phi = plateField(vUv, mask, energy);
+  if (energy > 0.0) {
+    float m2, e2;
+    vec2 ex = vec2(uTexel.x * 1.5, 0.0);
+    vec2 ey = vec2(0.0, uTexel.y * 1.5);
+    float gx = plateField(vUv + ex, m2, e2) - plateField(vUv - ex, m2, e2);
+    float gy = plateField(vUv + ey, m2, e2) - plateField(vUv - ey, m2, e2);
+    vec2 grad = vec2(gx, gy) / 3.0; // field change per texel
+    vec2 push = -phi * grad;
+    vel += push * mask * uCym * 170.0 * uDt;
+  }
   vec2 dye = texture(uDye, vUv).rg;
   // hot smoke rises, dense cool smoke settles a little
   vel.y += (dye.g * uBuoy - dye.r * 6.0) * uDt;

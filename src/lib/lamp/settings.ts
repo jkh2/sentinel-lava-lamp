@@ -11,6 +11,8 @@ export interface LampSettings {
   drive: number;
   /** How much the music recolors the light and smoke (0 = lamp color only). */
   hue: number;
+  /** How strongly notes draw Chladni figures in the smoke (0 = off). */
+  cymatics: number;
   palette: PaletteId;
   volume: number;
   paused: boolean;
@@ -27,6 +29,7 @@ export const DEFAULT_SETTINGS: LampSettings = {
   glow: 0.25,
   drive: 0.86,
   hue: 0.6,
+  cymatics: 0.65,
   palette: "amber",
   volume: 0.84,
   paused: false,

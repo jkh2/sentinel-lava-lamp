@@ -21,6 +21,8 @@ export interface LampParams {
   drive: number;
   /** How far the music may swing the light's color around the wheel (0–1). */
   hue: number;
+  /** Strength of the cymatic figures notes press into the smoke (0 = off). */
+  cymatics: number;
   paused: boolean;
   palette: Palette;
 }
@@ -31,7 +33,39 @@ export interface MusicState {
   mid: number;
   treble: number;
   live: boolean;
+  /** Dominant note (MIDI), -1 when none. */
+  noteMidi: number;
+  noteStrength: number;
+  /** Onset counter; a change means a note was just struck. */
+  onsets: number;
+  onsetStrength: number;
 }
+
+/** One ringing Chladni mode of the room's "plate". */
+interface PlateMode {
+  n: number;
+  m: number;
+  sign: number;
+  rot: number;
+  amp: number;
+  midi: number;
+}
+
+/**
+ * Chladni mode for a note (from Cymatic Cosmos): the pitch class picks the
+ * figure, each octave above the fourth adds a ring, and odd notes take the
+ * antisymmetric form so neighbouring notes look distinct.
+ */
+const MODES: Array<[number, number]> = [
+  [1, 3], [2, 3], [1, 4], [2, 5], [3, 4], [1, 5], [3, 5], [2, 7], [4, 5], [3, 7], [1, 6], [4, 7],
+];
+function modeFor(midi: number): Omit<PlateMode, "amp"> {
+  const pc = ((midi % 12) + 12) % 12;
+  const [a, b] = MODES[pc] ?? [1, 3];
+  const lift = Math.max(0, Math.min(2, Math.floor(midi / 12) - 4));
+  return { n: a + lift, m: b + lift, sign: midi % 2 === 0 ? 1 : -1, rot: pc * 0.2618, midi };
+}
+const PLATE_SLOTS = 3;
 
 interface FBO {
   texture: WebGLTexture;
@@ -171,7 +205,16 @@ export class LampEngine {
   readonly canvas: HTMLCanvasElement;
   params: LampParams;
   bass = 0;
-  music: MusicState = { bass: 0, mid: 0, treble: 0, live: false };
+  music: MusicState = {
+    bass: 0,
+    mid: 0,
+    treble: 0,
+    live: false,
+    noteMidi: -1,
+    noteStrength: 0,
+    onsets: 0,
+    onsetStrength: 0,
+  };
   time = 0;
   destroyed = false;
   private gl: WebGL2RenderingContext;
@@ -224,6 +267,9 @@ export class LampEngine {
   private flash = 0;
   private prevMusicBass = 0;
   private energy = 0;
+  private modes: PlateMode[] = [];
+  private seenOnsets = 0;
+  private modeA = new Float32Array(PLATE_SLOTS * 4);
   private readonly smokeOn: boolean;
 
   constructor(canvas: HTMLCanvasElement, params: LampParams) {
@@ -509,6 +555,60 @@ export class LampEngine {
     const rate = m.live ? 1.4 : 0.6;
     this.hue += (target - this.hue) * Math.min(1, dt * rate);
     this.flash *= Math.exp(-dt * 5);
+    this.updateModes(dt);
+  }
+
+  /**
+   * Notes ring the room like a Chladni plate. A struck note excites its mode;
+   * a held note keeps it ringing; everything decays over a couple of seconds.
+   * Up to three modes overlap, so chords and melodies morph the figure.
+   */
+  private updateModes(dt: number) {
+    const m = this.music;
+    const on = m.live && this.params.cymatics > 0.001;
+    const struck = m.onsets !== this.seenOnsets;
+    this.seenOnsets = m.onsets;
+    if (on && m.noteMidi >= 0 && m.noteStrength > 0.15) {
+      const same = this.modes.find((p) => p.midi === m.noteMidi);
+      if (struck) {
+        const amp = Math.min(1, 0.45 + m.onsetStrength * 0.6 + m.noteStrength * 0.3);
+        if (same) same.amp = Math.max(same.amp, amp);
+        else {
+          if (this.modes.length >= PLATE_SLOTS) {
+            this.modes.sort((a, b) => b.amp - a.amp);
+            this.modes.pop();
+          }
+          this.modes.push({ ...modeFor(m.noteMidi), amp });
+        }
+      } else if (same) {
+        // a held note keeps its mode ringing
+        const hold = m.noteStrength * 0.75;
+        if (same.amp < hold) same.amp += (hold - same.amp) * Math.min(1, dt * 1.5);
+      }
+    }
+    for (const p of this.modes) p.amp *= Math.exp(-dt / (on ? 2.2 : 0.6));
+    this.modes = this.modes.filter((p) => p.amp > 0.02);
+    const a = this.modeA;
+    a.fill(0);
+    this.modes.forEach((p, i) => {
+      const o = i * 4;
+      a[o] = p.n;
+      a[o + 1] = p.m;
+      a[o + 2] = p.sign * p.amp;
+      a[o + 3] = p.rot;
+    });
+  }
+
+  private setPlate(prog: Program) {
+    const gl = this.gl;
+    const aspect = this.aspect();
+    const c = lampToScreen(this.layout, aspect, 0, 0.56);
+    const k = this.params.cymatics;
+    gl.uniform4fv(prog.uniforms.uModes, this.modeA);
+    // plate centred on the glass; radius in screen heights
+    gl.uniform3f(prog.uniforms.uPlate, c.u, c.v, this.layout.height * 0.36);
+    gl.uniform1f(prog.uniforms.uSpread, 2.6);
+    gl.uniform1f(prog.uniforms.uCym, k);
   }
 
   // ---- public API ---------------------------------------------------------
@@ -695,6 +795,8 @@ export class LampEngine {
     gl.uniform4fv(inj.uniforms.uEmitB, this.emitB);
     gl.uniform1f(inj.uniforms.uAspect, aspect);
     gl.uniform1f(inj.uniforms.uDt, dt);
+    this.setPlate(inj);
+    gl.uniform1f(inj.uniforms.uTag, this.hue);
     this.blit(dye.write);
     dye.swap();
 
@@ -712,6 +814,8 @@ export class LampEngine {
     const treble = this.music.live ? this.music.treble * this.params.drive : 0;
     gl.uniform1f(f.uniforms.uTurb, 0.9 + this.params.swirl * 1.8 + treble * 2.2);
     gl.uniform1f(f.uniforms.uBuoy, 24);
+    gl.uniform2f(f.uniforms.uTexel, texel[0], texel[1]);
+    this.setPlate(f);
     this.blit(vel.write);
     vel.swap();
 

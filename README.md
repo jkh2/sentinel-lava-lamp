@@ -1,6 +1,6 @@
 # Sentinel Lava Lamp
 
-A glass lava lamp you can watch, stir, tune, and play music under. The wax runs on heat, the smoke behind it is a real fluid simulation, and the music can paint the whole room.
+A glass lava lamp you can watch, stir, tune, and play music under. The wax runs on heat, the smoke behind it is a real fluid simulation, and the music can paint the whole room and ring it like a Chladni plate, drawing each note's figure in the smoke.
 
 **Try it:** https://sentinel-lava-lamp.vercel.app
 
@@ -37,6 +37,7 @@ Open **Listen** (on a phone, tap **Listen** at the bottom).
    - **Kick drums** flash the light and push bursts of smoke up from the floor.
    - **Mids and highs** swing the room's light around the color wheel (warm lamps go through rose and magenta toward violet) and stir the air.
    - Each puff of smoke keeps the color of the moment it was released, so the rising smoke carries a trail of the song's colors.
+   - **Notes** ring the room like a Chladni plate. When a clear note or chord sounds, the smoke drifts onto that note's nodal lines and draws its figure across the room behind the lamp. Every pitch has its own figure, higher octaves add more rings, and overlapping notes morph into one another. Held notes keep ringing; the figure melts back into ordinary smoke a couple of seconds after the music lets go. Pure drums and noise don't draw figures; melodies, chords, voices and sustained notes do.
 
 You can also paste a **YouTube link** and press **Play**. It plays alongside the lamp, but browsers don't let a web page read YouTube's audio, so the lamp can't react to it. Upload a file for the full show.
 
@@ -56,6 +57,7 @@ Open **Tune** to change how the lamp behaves. The word on the right of each slid
 | **Glow** | Brightness of the bulb, the room light and the bloom. | dim → blaze |
 | **Music drive** | How hard the music pushes the wax, the smoke and the beat flashes. | ignore → kick |
 | **Music color** | How far the music may recolor the light and smoke. "Lamp only" keeps your palette. | lamp only → light show |
+| **Cymatics** | How strongly notes draw their Chladni figures in the smoke. | off → resonant |
 
 Buttons under the sliders:
 
@@ -70,6 +72,7 @@ Your settings are saved in this browser, so the lamp comes back the way you left
 - **Classic '70s:** Amber, Coil warm, Rise steady, Thickness syrup, Size gobs, Glow lamp.
 - **Night light:** Violet or Tide, Coil cool, Rise still, Glow dim, Music color lamp only.
 - **Party:** any color, Coil hot, Rise eager, Swirl curling, Music drive kick, Music color light show, then upload something with a big low end.
+- **Cymatic room:** Swirl calm, Cymatics resonant, Music color tinted, then upload something melodic: solo piano, strings, a choir, a singing bowl. Slow, clear notes draw the cleanest figures.
 - **Lava flow:** Magma, Thickness tar, Size globs, Chill holds heat. Big, slow, heavy wax.
 
 ### If something looks off
@@ -77,6 +80,7 @@ Your settings are saved in this browser, so the lamp comes back the way you left
 - **"WebGL2 is required."** The lamp draws everything on the graphics card. Use a current Chrome, Edge, Firefox or Safari, and make sure hardware acceleration is on.
 - **It runs slowly on an older device.** The lamp lowers its own internal resolution after a moment to keep the motion smooth. It may look a little softer.
 - **Music plays but the colors don't change.** Check that **Music color** isn't at "lamp only", and that you uploaded a file rather than using YouTube.
+- **No patterns in the smoke.** Check **Cymatics** isn't at "off". Figures need a clear pitch, so drum-heavy or very noisy passages won't draw them.
 - **No sound.** Check **Volume**, your device volume, and on iPhone the silent switch.
 
 ---
@@ -138,6 +142,24 @@ The smoke is shaded with fake self-shadowing (a short march toward the glowing g
 - **Treble** stirs the room's draft.
 - Every smoke puff stores the hue it was born under (density × hue in the smoke texture's blue channel), so rising smoke keeps the song's color history.
 
+### Cymatics: the room as a Chladni plate
+
+A second, finer analyser (an 8192-point FFT, about 5 Hz per bin) listens for notes. Real music has many pitches at once, so instead of chasing one frequency it folds the spectrum between 65 Hz and 4.2 kHz into the 12 pitch classes (a chromagram) and takes the one that dominates, with its octave from where that class's energy sits. A spectral-flux detector with an adaptive threshold marks onsets, the moments a note or chord is struck.
+
+Each struck note excites a mode of an imaginary plate centred on the glass and reaching across the room. The figure function comes from [Cymatic Cosmos](https://github.com/jkh2/cymatic-cosmos):
+
+```
+φ(x, y) = cos(nπx)·cos(mπy) ± cos(mπx)·cos(nπy)
+```
+
+The pitch class picks (n, m), higher octaves add rings (from middle C up, two steps at most), odd notes take the antisymmetric (−) form, and each pitch class turns the figure by 15°. Up to three modes ring at once and are summed, so a melody or a chord morphs the figure rather than swapping it. Struck modes decay over about two seconds; a held note keeps its mode ringing.
+
+The smoke shows the figure the way sand does on a bowed plate:
+
+- **Force:** the solver pushes smoke down the gradient of φ², off the vibrating antinodes and onto the still nodal lines where φ = 0.
+- **Press:** where the air is thin, a little smoke condenses along those nodal lines, tinted by the music color, so the figure appears even before the room's smoke drifts in.
+- The figure fades out toward the edges of the room, and once the music lets go the ordinary currents wash it back into billows.
+
 ### Keeping it smooth
 
 - The canvas is capped at 2× device pixel ratio and about 2.6 megapixels.
@@ -159,7 +181,7 @@ The smoke is shaded with fake self-shadowing (a short march toward the glowing g
 | `src/lib/lamp/geometry.ts` | Lamp profile, layout and coordinate conversions. |
 | `src/lib/lamp/palettes.ts` | The six color palettes. |
 | `src/lib/lamp/settings.ts` | Default settings and saving them in the browser. |
-| `src/lib/audio/rig.ts` | Audio playback and analysis, YouTube player. |
+| `src/lib/audio/rig.ts` | Audio playback, band analysis, note detection (chromagram and onsets), YouTube player. |
 | `public/env-studio.jpg`, `public/blue-noise.png` | Reflection probe and dither texture. |
 
 ---
@@ -182,3 +204,4 @@ Pushes to `main` deploy to Vercel automatically.
 - Glass and metal reflections use [Monochrome Studio 02](https://polyhaven.com/a/monochrome_studio_02) by Poly Haven (CC0), via the three.js examples.
 - Dithering and grain use a [blue-noise texture](https://github.com/Calinou/free-blue-noise-textures) by Christoph Peters (CC0).
 - The smoke solver is adapted from [Navier–Stokes Laboratory](https://github.com/jkh2/navier-stokes-laboratory).
+- The Chladni figures and the note-to-mode mapping come from [Cymatic Cosmos](https://github.com/jkh2/cymatic-cosmos).

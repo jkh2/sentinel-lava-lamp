@@ -145,6 +145,14 @@ export function TunePanel({
         high="light show"
         onChange={(hue) => onChange({ hue })}
       />
+      <Slider
+        label="Cymatics"
+        value={settings.cymatics}
+        low="off"
+        mid="patterns"
+        high="resonant"
+        onChange={(cymatics) => onChange({ cymatics })}
+      />
       <div className="tune-actions">
         <button type="button" className="btn grow" onClick={onReheat}>
           <RotateCcw size={16} aria-hidden />
