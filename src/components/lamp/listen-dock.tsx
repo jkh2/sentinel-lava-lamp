@@ -1,6 +1,6 @@
 import { memo, useEffect, useRef, useState, type FormEvent, type RefObject } from "react";
 import { ListeningRig, parseYouTubeId } from "@/lib/audio/rig";
-import { Pause, Play, Upload } from "lucide-react";
+import { Ear, Mic, MonitorUp, Pause, Play, Upload } from "lucide-react";
 
 function formatTime(seconds: number) {
   if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
@@ -38,6 +38,7 @@ export function ListenDock({
     title: "Nothing playing",
     error: "",
     youtube: false,
+    ear: "player" as ListeningRig["ear"],
   });
   const [busy, setBusy] = useState(false);
 
@@ -47,7 +48,7 @@ export function ListenDock({
     const tick = () => {
       const rig = rigRef.current;
       if (rig) {
-        const key = `${rig.mode}|${rig.playing}|${rig.title()}|${rig.error}`;
+        const key = `${rig.mode}|${rig.playing}|${rig.title()}|${rig.error}|${rig.ear}`;
         if (key !== lastKey) {
           lastKey = key;
           setSnap({
@@ -56,6 +57,7 @@ export function ListenDock({
             title: rig.title(),
             error: rig.error,
             youtube: rig.mode === "youtube",
+            ear: rig.ear,
           });
         }
         const bars = barsRef.current;
@@ -85,6 +87,29 @@ export function ListenDock({
     } catch (err) {
       rigRef.current.error = err instanceof Error ? err.message : "Could not play that file.";
       rigRef.current.onChange();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function hear(kind: "tab" | "room") {
+    const rig = rigRef.current;
+    if (!rig) return;
+    if (rig.ear === kind) {
+      rig.stopListening();
+      return;
+    }
+    setBusy(true);
+    try {
+      await rig.listen(kind);
+    } catch (err) {
+      const denied = err instanceof DOMException && err.name === "NotAllowedError";
+      rig.error = denied
+        ? "Sharing was cancelled or blocked."
+        : err instanceof Error
+          ? err.message
+          : "The lamp could not listen.";
+      rig.onChange();
     } finally {
       setBusy(false);
     }
@@ -128,8 +153,10 @@ export function ListenDock({
         <h2>Listen</h2>
       </div>
       <p className="note">
-        Drop an mp3, wav, or m4a — the coil follows the low end. A YouTube link plays
-        alongside; browsers cannot read that audio, so the wax keeps its own heat.
+        Drop an mp3, wav, or m4a and the whole lamp plays along. Browsers cannot read a
+        YouTube video's sound directly, so play it here, press <b>Hear this tab</b>, pick
+        this tab and turn on <b>Share tab audio</b>. <b>Hear the room</b> listens through
+        your microphone to anything playing nearby.
       </p>
       <input
         ref={fileRef}
@@ -145,6 +172,28 @@ export function ListenDock({
         <button type="button" className="btn btn-primary grow" onClick={() => fileRef.current?.click()}>
           <Upload size={16} aria-hidden />
           Upload audio
+        </button>
+      </div>
+      <div className="row">
+        <button
+          type="button"
+          className="btn grow"
+          data-on={snap.ear === "tab"}
+          disabled={busy}
+          onClick={() => void hear("tab")}
+        >
+          {snap.ear === "tab" ? <Ear size={16} aria-hidden /> : <MonitorUp size={16} aria-hidden />}
+          {snap.ear === "tab" ? "Stop hearing tab" : "Hear this tab"}
+        </button>
+        <button
+          type="button"
+          className="btn grow"
+          data-on={snap.ear === "room"}
+          disabled={busy}
+          onClick={() => void hear("room")}
+        >
+          {snap.ear === "room" ? <Ear size={16} aria-hidden /> : <Mic size={16} aria-hidden />}
+          {snap.ear === "room" ? "Stop hearing room" : "Hear the room"}
         </button>
       </div>
       <form className="field" onSubmit={(event) => void takeYouTube(event)}>

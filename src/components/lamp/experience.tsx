@@ -70,6 +70,7 @@ export function LampExperience() {
         __lampNote?: () => { midi: number; strength: number; onsets: number; bass: number; mid: number };
       };
       w.__lampAdvance = (s) => engine.advance(s);
+      (w as unknown as { __lampPlate?: () => unknown }).__lampPlate = () => engine.plateState();
       w.__lampTrackTime = () => (rig.audio.paused ? -1 : rig.audio.currentTime);
       w.__lampNote = () => ({ midi: rig.noteMidi, strength: rig.noteStrength, onsets: rig.onsets, bass: rig.bass, mid: rig.mid });
       w.__lampSeek = (t) => {
@@ -101,12 +102,18 @@ export function LampExperience() {
       p.drive = current.drive;
       p.hue = current.hue;
       p.cymatics = current.cymatics;
+      p.lead = current.lead;
+      p.beats = current.beats;
+      p.pulse = current.pulse;
+      p.snap = current.snap;
       p.paused = current.paused;
       p.palette = palette;
+      rig.sensitivity = current.sensitivity;
       engine.bass = rig.bass;
-      // Only an uploaded file can be analysed; YouTube audio is out of reach.
+      // Live when an uploaded file plays, or when the lamp is hearing a shared
+      // tab or the room. A YouTube iframe alone cannot be read by the page.
       const m = engine.music;
-      m.live = rig.mode === "file" && !rig.audio.paused;
+      m.live = rig.live;
       m.bass = rig.bass;
       m.mid = rig.mid;
       m.treble = rig.treble;

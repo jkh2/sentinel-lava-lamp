@@ -23,6 +23,14 @@ export interface LampParams {
   hue: number;
   /** Strength of the cymatic figures notes press into the smoke (0 = off). */
   cymatics: number;
+  /** While music plays, how much it leads the smoke over the lamp's own drift (0–1). */
+  lead: number;
+  /** How hard each beat pushes a burst of smoke and a flash of light (0–1). */
+  beats: number;
+  /** How much the wax and lamp glow pulse on beats (0–1). */
+  pulse: number;
+  /** How quickly an earlier note's figure gives way to the new note's (0–1). */
+  snap: number;
   paused: boolean;
   palette: Palette;
 }
@@ -268,7 +276,14 @@ export class LampEngine {
   private prevMusicBass = 0;
   private energy = 0;
   private modes: PlateMode[] = [];
+  /** Pitch heard this frame, and since when (for the ~70 ms settle). */
+  private candNote = -1;
+  private candSince = 0;
+  /** The pitch that currently owns the plate, or -1. */
+  private curNote = -1;
   private seenOnsets = 0;
+  /** Onset counter last seen by the beat flash (separate from the cymatics one). */
+  private seenBeatOnsets = 0;
   private modeA = new Float32Array(PLATE_SLOTS * 4);
   private readonly smokeOn: boolean;
 
@@ -508,7 +523,9 @@ export class LampEngine {
   /** The palette's own lamp light, before the music recolors it. */
   private baseLight(): [number, number, number] {
     const pal = this.params.palette;
-    const k = (0.5 + this.params.glow * 1.2) * (1 + this.bass * this.params.drive * 0.7);
+    const k =
+      (0.5 + this.params.glow * 1.2) *
+      (1 + this.bass * this.params.drive * 0.7 + this.flash * this.params.pulse * 0.55);
     return [
       (pal.mid[0] * 0.55 + pal.hot[0] * 0.45) * k,
       (pal.mid[1] * 0.55 + pal.hot[1] * 0.45) * k,
@@ -547,10 +564,17 @@ export class LampEngine {
       target = -(shift * 0.42 + drift) * amount;
       const onset = Math.max(0, m.bass - this.prevMusicBass);
       if (onset > 0.04) this.flash = Math.max(this.flash, Math.min(1, onset * 4) * this.params.drive);
+      // every detected onset (a drum hit, a struck chord) fires a burst too,
+      // so the show keeps time with the song instead of waiting for big bass jumps
+      if (m.onsets !== this.seenBeatOnsets) {
+        const hit = (0.4 + 0.6 * m.onsetStrength) * (0.35 + this.params.beats * 0.9);
+        this.flash = Math.max(this.flash, Math.min(1.2, hit));
+      }
       this.energy += (level - this.energy) * Math.min(1, dt * 3);
     } else {
       this.energy += (0 - this.energy) * Math.min(1, dt * 1.5);
     }
+    this.seenBeatOnsets = m.onsets;
     this.prevMusicBass = m.bass;
     const rate = m.live ? 1.4 : 0.6;
     this.hue += (target - this.hue) * Math.min(1, dt * rate);
@@ -568,25 +592,46 @@ export class LampEngine {
     const on = m.live && this.params.cymatics > 0.001;
     const struck = m.onsets !== this.seenOnsets;
     this.seenOnsets = m.onsets;
-    if (on && m.noteMidi >= 0 && m.noteStrength > 0.15) {
-      const same = this.modes.find((p) => p.midi === m.noteMidi);
-      if (struck) {
-        const amp = Math.min(1, 0.45 + m.onsetStrength * 0.6 + m.noteStrength * 0.3);
-        if (same) same.amp = Math.max(same.amp, amp);
+    // Like a bowed plate: the figure belongs to the pitch sounding NOW. A new
+    // pitch takes the plate as soon as it has held ~70 ms (so a passing blip
+    // does not redraw the room), and the figures of earlier notes give way at
+    // the rate set by `snap`, instead of all ringing together into mud.
+    if (m.noteMidi !== this.candNote) {
+      this.candNote = m.noteMidi;
+      this.candSince = this.time;
+    }
+    const settled =
+      this.candNote >= 0 && this.time - this.candSince > 0.07 && m.noteStrength > 0.06;
+    const changed = settled && this.candNote !== this.curNote;
+    if (changed) this.curNote = this.candNote;
+    if (on && settled && (changed || struck || m.noteStrength > 0.15)) {
+      const midi = this.curNote;
+      const target = Math.min(
+        1,
+        0.5 + m.noteStrength * 0.4 + (struck ? m.onsetStrength * 0.4 : 0),
+      );
+      const same = this.modes.find((p) => p.midi === midi);
+      if (same) {
+        if (changed || struck) same.amp = Math.max(same.amp, target);
         else {
-          if (this.modes.length >= PLATE_SLOTS) {
-            this.modes.sort((a, b) => b.amp - a.amp);
-            this.modes.pop();
-          }
-          this.modes.push({ ...modeFor(m.noteMidi), amp });
+          // a held note keeps its figure ringing
+          const hold = m.noteStrength * 0.75;
+          if (same.amp < hold) same.amp += (hold - same.amp) * Math.min(1, dt * 1.5);
         }
-      } else if (same) {
-        // a held note keeps its mode ringing
-        const hold = m.noteStrength * 0.75;
-        if (same.amp < hold) same.amp += (hold - same.amp) * Math.min(1, dt * 1.5);
+      } else {
+        if (this.modes.length >= PLATE_SLOTS) {
+          this.modes.sort((a, b) => b.amp - a.amp);
+          this.modes.pop();
+        }
+        this.modes.push({ ...modeFor(midi), amp: target });
       }
     }
-    for (const p of this.modes) p.amp *= Math.exp(-dt / (on ? 2.2 : 0.6));
+    if (!settled && m.noteStrength < 0.05) this.curNote = -1;
+    const giveWay = 1.6 - this.params.snap * 1.42; // lingering 1.6 s … instant 0.18 s
+    for (const p of this.modes) {
+      const tau = !on ? 0.6 : p.midi === this.curNote ? 2.2 : giveWay;
+      p.amp *= Math.exp(-dt / tau);
+    }
     this.modes = this.modes.filter((p) => p.amp > 0.02);
     const a = this.modeA;
     a.fill(0);
@@ -597,6 +642,14 @@ export class LampEngine {
       a[o + 2] = p.sign * p.amp;
       a[o + 3] = p.rot;
     });
+  }
+
+  /** Dev/QA view of the plate: which notes' figures are ringing, and how hard. */
+  plateState() {
+    return {
+      owner: this.curNote,
+      modes: this.modes.map((p) => ({ midi: p.midi, amp: Math.round(p.amp * 100) / 100 })),
+    };
   }
 
   private setPlate(prog: Program) {
@@ -749,11 +802,15 @@ export class LampEngine {
       const o = i * 4;
       const lane = (i + 0.5) / 4;
       const x = lane + 0.1 * noise1(t * 0.03 + i * 37.7);
-      // bursty: mostly quiet, then a soft swell of smoke
-      const swell = noise1(t * 0.16 + i * 11.3) * 1.25 + 0.15;
+      // bursty: mostly quiet, then a soft swell of smoke. While music plays,
+      // the lamp's own weather steps back (by `lead`) so the song is what you see.
+      const live = this.music.live;
+      const own = live ? 1 - this.params.lead * 0.75 : 1;
+      const swell = (noise1(t * 0.16 + i * 11.3) * 1.25 + 0.15) * own;
       // music: bass swells every source, beats push out a burst
-      const music = this.music.live
-        ? this.music.bass * this.params.drive * 0.9 + this.flash * 1.1
+      const music = live
+        ? this.music.bass * this.params.drive * (0.6 + this.params.lead * 0.8) +
+          this.flash * (0.6 + this.params.beats * 1.4)
         : 0;
       const puff = Math.max(0, swell) ** 1.5 + music;
       a[o] = Math.min(0.9, Math.max(0.1, x));
@@ -926,7 +983,8 @@ export class LampEngine {
     gl.uniform2f(lp.uniforms.uResolution, this.comp.width, this.comp.height);
     gl.uniform1f(lp.uniforms.uTime, this.time);
     gl.uniform1f(lp.uniforms.uGlow, this.params.glow);
-    gl.uniform1f(lp.uniforms.uBass, bass);
+    // the wax glows with the low end and flares on beats
+    gl.uniform1f(lp.uniforms.uBass, bass + this.flash * this.params.pulse * 0.8);
     gl.uniform3f(lp.uniforms.uCool, pal.cool[0], pal.cool[1], pal.cool[2]);
     gl.uniform3f(lp.uniforms.uMid, pal.mid[0], pal.mid[1], pal.mid[2]);
     gl.uniform3f(lp.uniforms.uHot, pal.hot[0], pal.hot[1], pal.hot[2]);

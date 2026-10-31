@@ -13,6 +13,16 @@ export interface LampSettings {
   hue: number;
   /** How strongly notes draw Chladni figures in the smoke (0 = off). */
   cymatics: number;
+  /** While music plays, how much it leads the smoke over the lamp's own drift. */
+  lead: number;
+  /** How hard each beat pushes smoke and flashes the light. */
+  beats: number;
+  /** How much the wax and glow flare on beats. */
+  pulse: number;
+  /** How readily a sound counts as a beat (higher hears more beats). */
+  sensitivity: number;
+  /** How quickly the old note's figure gives way when the note changes. */
+  snap: number;
   palette: PaletteId;
   volume: number;
   paused: boolean;
@@ -30,6 +40,11 @@ export const DEFAULT_SETTINGS: LampSettings = {
   drive: 0.86,
   hue: 0.6,
   cymatics: 0.65,
+  lead: 0.7,
+  beats: 0.65,
+  pulse: 0.55,
+  sensitivity: 0.5,
+  snap: 0.65,
   palette: "amber",
   volume: 0.84,
   paused: false,
