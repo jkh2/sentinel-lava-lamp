@@ -106,6 +106,7 @@ export function LampExperience() {
       p.beats = current.beats;
       p.pulse = current.pulse;
       p.snap = current.snap;
+      p.plate = current.plate === "square" ? "square" : "water";
       p.paused = current.paused;
       p.palette = palette;
       rig.sensitivity = current.sensitivity;

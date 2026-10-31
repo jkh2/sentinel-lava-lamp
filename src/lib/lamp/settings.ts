@@ -23,6 +23,8 @@ export interface LampSettings {
   sensitivity: number;
   /** How quickly the old note's figure gives way when the note changes. */
   snap: number;
+  /** Cymatics medium: a round water dish (CymaScope-like) or a square plate. */
+  plate: "water" | "square";
   palette: PaletteId;
   volume: number;
   paused: boolean;
@@ -45,6 +47,7 @@ export const DEFAULT_SETTINGS: LampSettings = {
   pulse: 0.55,
   sensitivity: 0.5,
   snap: 0.65,
+  plate: "water",
   palette: "amber",
   volume: 0.84,
   paused: false,

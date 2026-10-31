@@ -31,6 +31,8 @@ export interface LampParams {
   pulse: number;
   /** How quickly an earlier note's figure gives way to the new note's (0–1). */
   snap: number;
+  /** The figure's medium: a round water dish (CymaScope-like) or a square plate. */
+  plate: "water" | "square";
   paused: boolean;
   palette: Palette;
 }
@@ -72,6 +74,18 @@ function modeFor(midi: number): Omit<PlateMode, "amp"> {
   const [a, b] = MODES[pc] ?? [1, 3];
   const lift = Math.max(0, Math.min(2, Math.floor(midi / 12) - 4));
   return { n: a + lift, m: b + lift, sign: midi % 2 === 0 ? 1 : -1, rot: pc * 0.2618, midi };
+}
+/**
+ * Water-dish figure for a note. Petal count walks the circle of fifths, so
+ * notes that sound close in harmony look close (C 5 petals, G 6, D 7 …) while
+ * clashing neighbours look very different (C 5, C# 12). Each octave above the
+ * second adds a ring, as rising pitch enriches a CymaScope image.
+ */
+function waterModeFor(midi: number): Omit<PlateMode, "amp"> {
+  const pc = ((midi % 12) + 12) % 12;
+  const folds = 5 + ((pc * 7) % 12);
+  const rings = 2 + Math.max(0, Math.min(3, Math.floor(midi / 12) - 3));
+  return { n: folds, m: rings, sign: midi % 2 === 0 ? 1 : -1, rot: pc * 0.2618, midi };
 }
 const PLATE_SLOTS = 3;
 
@@ -598,10 +612,17 @@ export class LampEngine {
     // the rate set by `snap`, instead of all ringing together into mud.
     if (m.noteMidi !== this.candNote) {
       this.candNote = m.noteMidi;
-      this.candSince = this.time;
+      // wall clock, not simulation time: musical timing must not stretch
+      // when the browser throttles frames
+      this.candSince = performance.now() / 1000;
     }
+    // smoke needs a moment to draw a figure: a pitch must hold 0.12-0.32 s
+    // (Pattern change: instant … lingering) before it takes the plate
+    const settle = 0.32 - this.params.snap * 0.2;
     const settled =
-      this.candNote >= 0 && this.time - this.candSince > 0.07 && m.noteStrength > 0.06;
+      this.candNote >= 0 &&
+      performance.now() / 1000 - this.candSince > settle &&
+      m.noteStrength > 0.06;
     const changed = settled && this.candNote !== this.curNote;
     if (changed) this.curNote = this.candNote;
     if (on && settled && (changed || struck || m.noteStrength > 0.15)) {
@@ -623,7 +644,8 @@ export class LampEngine {
           this.modes.sort((a, b) => b.amp - a.amp);
           this.modes.pop();
         }
-        this.modes.push({ ...modeFor(midi), amp: target });
+        const shape = this.params.plate === "water" ? waterModeFor(midi) : modeFor(midi);
+        this.modes.push({ ...shape, amp: target });
       }
     }
     if (!settled && m.noteStrength < 0.05) this.curNote = -1;
@@ -648,6 +670,10 @@ export class LampEngine {
   plateState() {
     return {
       owner: this.curNote,
+      cand: this.candNote,
+      held: Math.round((performance.now() / 1000 - this.candSince) * 100) / 100,
+      settle: 0.32 - this.params.snap * 0.2,
+      live: this.music.live,
       modes: this.modes.map((p) => ({ midi: p.midi, amp: Math.round(p.amp * 100) / 100 })),
     };
   }
@@ -662,6 +688,7 @@ export class LampEngine {
     gl.uniform3f(prog.uniforms.uPlate, c.u, c.v, this.layout.height * 0.36);
     gl.uniform1f(prog.uniforms.uSpread, 2.6);
     gl.uniform1f(prog.uniforms.uCym, k);
+    gl.uniform1f(prog.uniforms.uWater, this.params.plate === "water" ? 1 : 0);
   }
 
   // ---- public API ---------------------------------------------------------

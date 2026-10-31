@@ -138,6 +138,11 @@ export class ListeningRig {
   private prevMag = new Float32Array(0);
   private binPc = new Int8Array(0);
   private binMidi = new Float32Array(0);
+  /** Per-bin weight in the chromagram: bass below 200 Hz counts at a quarter. */
+  private binW = new Float32Array(0);
+  /** Each pitch class's slow average share, to favor notes as they arrive. */
+  private chromaSlow = new Float32Array(12).fill(1 / 12);
+  private lastPitch = 0;
   private binLo = 0;
   private binHi = 0;
   private chroma = new Float32Array(12);
@@ -192,12 +197,15 @@ export class ListeningRig {
       this.prevMag = new Float32Array(bins);
       this.binPc = new Int8Array(bins);
       this.binMidi = new Float32Array(bins);
+      this.binW = new Float32Array(bins);
       this.binLo = Math.max(1, Math.floor(65 / hz));
       this.binHi = Math.min(bins - 1, Math.ceil(4200 / hz));
       for (let i = 0; i < bins; i++) {
         const f = i * hz;
         const midi = f > 0 ? 69 + 12 * Math.log2(f / 440) : 0;
         this.binMidi[i] = midi;
+        // drones and bass lines sit under everything; the melody lives above
+        this.binW[i] = f < 200 ? 0.25 : 1;
         this.binPc[i] = ((Math.round(midi) % 12) + 12) % 12;
       }
     }
@@ -494,13 +502,29 @@ export class ListeningRig {
       const prev = this.prevMag[i] ?? 0;
       if (mag > prev) flux += mag - prev;
       this.prevMag[i] = mag;
-      const e = mag * mag;
+      const e = mag * mag * (this.binW[i] ?? 1);
       total += e;
       const pc = this.binPc[i] ?? 0;
       chroma[pc] = (chroma[pc] ?? 0) + e;
     }
+    // pick the pitch class by its share now plus how far it has risen above
+    // its own slow average: a newly sounded note rises, a held drone does not
+    const nowS = performance.now() / 1000;
+    const dtp = this.lastPitch ? Math.min(0.25, nowS - this.lastPitch) : 1 / 60;
+    this.lastPitch = nowS;
+    const follow = 1 - Math.exp(-dtp / 1.5);
     let best = 0;
-    for (let k = 1; k < 12; k++) if ((chroma[k] ?? 0) > (chroma[best] ?? 0)) best = k;
+    let bestScore = -1;
+    for (let k = 0; k < 12; k++) {
+      const share = total > 1e-9 ? (chroma[k] ?? 0) / total : 0;
+      const slow = this.chromaSlow[k] ?? 1 / 12;
+      const score = share + Math.max(0, share - slow);
+      this.chromaSlow[k] = slow + (share - slow) * follow;
+      if (score > bestScore) {
+        bestScore = score;
+        best = k;
+      }
+    }
     const share = total > 1e-9 ? (chroma[best] ?? 0) / total : 0;
     // 1/12 ≈ 0.083 is noise; a clean note or simple chord sits well above
     const strength = total > 1e-7 ? Math.min(1, Math.max(0, (share - 0.14) / 0.32)) : 0;
@@ -512,7 +536,7 @@ export class ListeningRig {
       for (let i = this.binLo; i <= this.binHi; i++) {
         if (this.binPc[i] !== best) continue;
         const m = this.prevMag[i] ?? 0;
-        const w = m * m;
+        const w = m * m * (this.binW[i] ?? 1);
         wsum += w;
         msum += w * (this.binMidi[i] ?? 0);
       }
