@@ -153,6 +153,38 @@ export function TunePanel({
         high="resonant"
         onChange={(cymatics) => onChange({ cymatics })}
       />
+      <Slider
+        label="Music leads"
+        value={settings.lead}
+        low="lamp's own"
+        mid="shared"
+        high="the song"
+        onChange={(lead) => onChange({ lead })}
+      />
+      <Slider
+        label="Beat bursts"
+        value={settings.beats}
+        low="gentle"
+        mid="puffs"
+        high="bursts"
+        onChange={(beats) => onChange({ beats })}
+      />
+      <Slider
+        label="Wax pulse"
+        value={settings.pulse}
+        low="steady"
+        mid="breathing"
+        high="flaring"
+        onChange={(pulse) => onChange({ pulse })}
+      />
+      <Slider
+        label="Beat sensitivity"
+        value={settings.sensitivity}
+        low="big hits"
+        mid="the beat"
+        high="every note"
+        onChange={(sensitivity) => onChange({ sensitivity })}
+      />
       <div className="tune-actions">
         <button type="button" className="btn grow" onClick={onReheat}>
           <RotateCcw size={16} aria-hidden />

@@ -107,7 +107,28 @@ export class ListeningRig {
   /** Strength of the most recent onset, 0–1. */
   onsetStrength = 0;
   volume = 0.85;
+  /**
+   * What the lamp listens to. "player" analyses its own uploaded file.
+   * "tab" hears a shared browser tab (including this one, so a YouTube video
+   * playing in the lamp can drive the show). "room" hears the microphone.
+   */
+  ear: "player" | "tab" | "room" = "player";
+  /** 0–1: how readily a jump in the spectrum counts as a beat. */
+  sensitivity = 0.5;
   onChange: () => void = () => {};
+  private stream: MediaStream | null = null;
+  private streamSource: MediaStreamAudioSourceNode | null = null;
+  /**
+   * Slow peak and valley followers per band. Each band is shown between its
+   * own recent quiet and loud points, so a quiet song, a loud mastered one, or
+   * a microphone across the room all swing the show through its full range.
+   */
+  private bands = {
+    bass: { peak: 0.3, valley: 0 },
+    mid: { peak: 0.3, valley: 0 },
+    treble: { peak: 0.25, valley: 0 },
+  };
+  private lastSample = 0;
   private ctx: AudioContext | null = null;
   private analyser: AnalyserNode | null = null;
   private freq = new Uint8Array(0);
@@ -149,10 +170,16 @@ export class ListeningRig {
       this.analyser = this.ctx.createAnalyser();
       this.analyser.fftSize = 1024;
       this.analyser.smoothingTimeConstant = 0.78;
+      // headroom: the default -30 dB ceiling pins loud, mastered bass at full
+      // scale, which leaves the show nothing to move with
+      this.analyser.minDecibels = -95;
+      this.analyser.maxDecibels = -12;
       this.freq = new Uint8Array(this.analyser.frequencyBinCount);
       this.source = this.ctx.createMediaElementSource(this.audio);
+      // the player goes straight to the speakers; the analysers only listen,
+      // so a microphone or shared tab can feed them without echoing
+      this.source.connect(this.ctx.destination);
       this.source.connect(this.analyser);
-      this.analyser.connect(this.ctx.destination);
       // pitch analyser: listens only, not connected to the output
       const pa = this.ctx.createAnalyser();
       pa.fftSize = 8192;
@@ -250,6 +277,83 @@ export class ListeningRig {
     if (this.mode === "youtube") this.mode = "idle";
   }
 
+  /** True when there is real sound to analyse (not the idle breathing). */
+  get live() {
+    if (this.ear !== "player") return this.streamSource !== null;
+    return this.mode === "file" && !this.audio.paused && !this.audio.ended;
+  }
+
+  /**
+   * Listen to a shared tab or the room instead of the lamp's own player.
+   * Browsers cannot read a YouTube iframe's audio directly, but they can share
+   * a tab's sound with the user's permission, and that tab can be this one.
+   */
+  async listen(kind: "tab" | "room") {
+    this.error = "";
+    await this.ensureGraph();
+    this.stopListening(false);
+    const raw = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
+    const devices = navigator.mediaDevices;
+    let stream: MediaStream;
+    if (kind === "tab") {
+      if (!devices?.getDisplayMedia) throw new Error("This browser cannot share a tab's sound.");
+      stream = await devices.getDisplayMedia({ video: true, audio: raw });
+      if (stream.getAudioTracks().length === 0) {
+        stream.getTracks().forEach((t) => t.stop());
+        throw new Error('No sound came with that share. Pick a tab and turn on "Share tab audio".');
+      }
+    } else {
+      if (!devices?.getUserMedia) throw new Error("This browser cannot use a microphone.");
+      stream = await devices.getUserMedia({ audio: raw });
+    }
+    const ctx = this.ctx;
+    if (!ctx || !this.analyser || !this.pitchAnalyser) throw new Error("Audio did not start.");
+    const src = ctx.createMediaStreamSource(new MediaStream(stream.getAudioTracks()));
+    src.connect(this.analyser);
+    src.connect(this.pitchAnalyser);
+    // while listening outward, the player stops feeding the analysers so a
+    // shared tab that already contains it is not counted twice
+    try {
+      this.source?.disconnect(this.analyser);
+      this.source?.disconnect(this.pitchAnalyser);
+    } catch {
+      /* already disconnected */
+    }
+    this.stream = stream;
+    this.streamSource = src;
+    this.ear = kind;
+    this.bands = {
+      bass: { peak: 0.15, valley: 0 },
+      mid: { peak: 0.15, valley: 0 },
+      treble: { peak: 0.12, valley: 0 },
+    };
+    for (const track of stream.getTracks()) {
+      track.addEventListener("ended", () => {
+        if (this.stream === stream) this.stopListening();
+      });
+    }
+    this.onChange();
+  }
+
+  stopListening(notify = true) {
+    if (this.streamSource) {
+      try {
+        this.streamSource.disconnect();
+      } catch {
+        /* already gone */
+      }
+      if (this.source && this.analyser && this.pitchAnalyser) {
+        this.source.connect(this.analyser);
+        this.source.connect(this.pitchAnalyser);
+      }
+    }
+    this.stream?.getTracks().forEach((t) => t.stop());
+    this.stream = null;
+    this.streamSource = null;
+    this.ear = "player";
+    if (notify) this.onChange();
+  }
+
   setVolume(volume: number) {
     this.volume = volume;
     this.audio.volume = volume;
@@ -319,6 +423,8 @@ export class ListeningRig {
   }
 
   title() {
+    if (this.ear === "tab") return "Listening to a shared tab";
+    if (this.ear === "room") return "Listening to the room";
     if (this.mode === "youtube") return this.videoTitle || "YouTube";
     if (this.mode === "file") return this.fileName || "Uploaded track";
     return "Nothing playing";
@@ -326,7 +432,7 @@ export class ListeningRig {
 
   sample() {
     const idle = this.mode === "youtube" ? 0.2 : 0.1;
-    if (this.mode !== "file" || !this.analyser || this.audio.paused) {
+    if (!this.analyser || !this.live) {
       this.bass += (idle + Math.sin(performance.now() / 900) * 0.06 - this.bass) * 0.08;
       this.mid += (idle * 0.4 - this.mid) * 0.08;
       this.treble += (0 - this.treble) * 0.08;
@@ -345,9 +451,23 @@ export class ListeningRig {
       for (let i = i0; i <= i1; i++) sum += this.freq[i] ?? 0;
       return sum / Math.max(1, i1 - i0 + 1) / 255;
     };
-    const bass = Math.min(1, avg(2, 10) * 1.45);
-    const mid = Math.min(1, avg(12, 48));
-    const treble = Math.min(1, avg(70, 180));
+    // auto-level by time, not frames (screens run 60 to 144+ fps): peaks and
+    // valleys relax toward the signal over a few seconds, and each band is
+    // shown between them
+    const nowMs = performance.now();
+    const dt = this.lastSample ? Math.min(0.25, (nowMs - this.lastSample) / 1000) : 1 / 60;
+    this.lastSample = nowMs;
+    const relax = 1 - Math.exp(-dt / 3);
+    const level = (raw: number, key: "bass" | "mid" | "treble", floor: number) => {
+      const b = this.bands[key];
+      b.peak = raw > b.peak ? raw : b.peak + (raw - b.peak) * relax;
+      b.valley = raw < b.valley ? raw : b.valley + (raw - b.valley) * relax;
+      const base = b.valley * 0.8;
+      return Math.min(1, Math.max(0, (raw - base) / Math.max(floor, b.peak - base)));
+    };
+    const bass = level(avg(2, 10), "bass", 0.12);
+    const mid = level(Math.min(1, avg(12, 48)), "mid", 0.1);
+    const treble = level(Math.min(1, avg(70, 180)), "treble", 0.08);
     this.bass += (bass - this.bass) * 0.38;
     this.mid += (mid - this.mid) * 0.28;
     this.treble += (treble - this.treble) * 0.22;
@@ -385,7 +505,7 @@ export class ListeningRig {
     // 1/12 ≈ 0.083 is noise; a clean note or simple chord sits well above
     const strength = total > 1e-7 ? Math.min(1, Math.max(0, (share - 0.14) / 0.32)) : 0;
     this.noteStrength += (strength - this.noteStrength) * 0.35;
-    if (strength > 0.12) {
+    if (strength > 0.08) {
       // octave: energy-weighted pitch of the bins in the winning class
       let wsum = 0;
       let msum = 0;
@@ -405,7 +525,8 @@ export class ListeningRig {
     // adaptive onset threshold on the flux
     const now = performance.now() / 1000;
     const std = Math.sqrt(Math.max(0, this.fluxVar));
-    const hit = flux > this.fluxMean + std * 2.2 + 0.002 && now - this.lastOnset > 0.11;
+    const k = 3.1 - this.sensitivity * 2.0; // 0.5 ≈ the original 2.2σ
+    const hit = flux > this.fluxMean + std * k + 0.002 && now - this.lastOnset > 0.11;
     if (hit) {
       this.onsets += 1;
       this.lastOnset = now;
@@ -417,7 +538,7 @@ export class ListeningRig {
   }
 
   bars(): number[] {
-    if (!this.analyser || this.mode !== "file" || this.audio.paused) {
+    if (!this.analyser || !this.live) {
       return Array.from({ length: 12 }, () => 0.08);
     }
     const out: number[] = [];
@@ -433,6 +554,7 @@ export class ListeningRig {
   }
 
   destroy() {
+    this.stopListening(false);
     this.audio.pause();
     this.stopYouTube();
     if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);
