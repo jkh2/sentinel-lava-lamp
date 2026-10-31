@@ -154,6 +154,14 @@ export function TunePanel({
         onChange={(cymatics) => onChange({ cymatics })}
       />
       <Slider
+        label="Pattern change"
+        value={settings.snap}
+        low="lingering"
+        mid="morphing"
+        high="instant"
+        onChange={(snap) => onChange({ snap })}
+      />
+      <Slider
         label="Music leads"
         value={settings.lead}
         low="lamp's own"

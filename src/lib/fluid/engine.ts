@@ -29,6 +29,8 @@ export interface LampParams {
   beats: number;
   /** How much the wax and lamp glow pulse on beats (0–1). */
   pulse: number;
+  /** How quickly an earlier note's figure gives way to the new note's (0–1). */
+  snap: number;
   paused: boolean;
   palette: Palette;
 }
@@ -274,6 +276,11 @@ export class LampEngine {
   private prevMusicBass = 0;
   private energy = 0;
   private modes: PlateMode[] = [];
+  /** Pitch heard this frame, and since when (for the ~70 ms settle). */
+  private candNote = -1;
+  private candSince = 0;
+  /** The pitch that currently owns the plate, or -1. */
+  private curNote = -1;
   private seenOnsets = 0;
   /** Onset counter last seen by the beat flash (separate from the cymatics one). */
   private seenBeatOnsets = 0;
@@ -585,28 +592,46 @@ export class LampEngine {
     const on = m.live && this.params.cymatics > 0.001;
     const struck = m.onsets !== this.seenOnsets;
     this.seenOnsets = m.onsets;
-    // full songs rarely let one note dominate, so a struck onset may excite
-    // the figure at a lower clarity than a held note needs
-    const clear = m.noteStrength > 0.15 || (struck && m.noteStrength > 0.06);
-    if (on && m.noteMidi >= 0 && clear) {
-      const same = this.modes.find((p) => p.midi === m.noteMidi);
-      if (struck) {
-        const amp = Math.min(1, 0.45 + m.onsetStrength * 0.6 + m.noteStrength * 0.3);
-        if (same) same.amp = Math.max(same.amp, amp);
+    // Like a bowed plate: the figure belongs to the pitch sounding NOW. A new
+    // pitch takes the plate as soon as it has held ~70 ms (so a passing blip
+    // does not redraw the room), and the figures of earlier notes give way at
+    // the rate set by `snap`, instead of all ringing together into mud.
+    if (m.noteMidi !== this.candNote) {
+      this.candNote = m.noteMidi;
+      this.candSince = this.time;
+    }
+    const settled =
+      this.candNote >= 0 && this.time - this.candSince > 0.07 && m.noteStrength > 0.06;
+    const changed = settled && this.candNote !== this.curNote;
+    if (changed) this.curNote = this.candNote;
+    if (on && settled && (changed || struck || m.noteStrength > 0.15)) {
+      const midi = this.curNote;
+      const target = Math.min(
+        1,
+        0.5 + m.noteStrength * 0.4 + (struck ? m.onsetStrength * 0.4 : 0),
+      );
+      const same = this.modes.find((p) => p.midi === midi);
+      if (same) {
+        if (changed || struck) same.amp = Math.max(same.amp, target);
         else {
-          if (this.modes.length >= PLATE_SLOTS) {
-            this.modes.sort((a, b) => b.amp - a.amp);
-            this.modes.pop();
-          }
-          this.modes.push({ ...modeFor(m.noteMidi), amp });
+          // a held note keeps its figure ringing
+          const hold = m.noteStrength * 0.75;
+          if (same.amp < hold) same.amp += (hold - same.amp) * Math.min(1, dt * 1.5);
         }
-      } else if (same) {
-        // a held note keeps its mode ringing
-        const hold = m.noteStrength * 0.75;
-        if (same.amp < hold) same.amp += (hold - same.amp) * Math.min(1, dt * 1.5);
+      } else {
+        if (this.modes.length >= PLATE_SLOTS) {
+          this.modes.sort((a, b) => b.amp - a.amp);
+          this.modes.pop();
+        }
+        this.modes.push({ ...modeFor(midi), amp: target });
       }
     }
-    for (const p of this.modes) p.amp *= Math.exp(-dt / (on ? 2.2 : 0.6));
+    if (!settled && m.noteStrength < 0.05) this.curNote = -1;
+    const giveWay = 1.6 - this.params.snap * 1.42; // lingering 1.6 s … instant 0.18 s
+    for (const p of this.modes) {
+      const tau = !on ? 0.6 : p.midi === this.curNote ? 2.2 : giveWay;
+      p.amp *= Math.exp(-dt / tau);
+    }
     this.modes = this.modes.filter((p) => p.amp > 0.02);
     const a = this.modeA;
     a.fill(0);
@@ -617,6 +642,14 @@ export class LampEngine {
       a[o + 2] = p.sign * p.amp;
       a[o + 3] = p.rot;
     });
+  }
+
+  /** Dev/QA view of the plate: which notes' figures are ringing, and how hard. */
+  plateState() {
+    return {
+      owner: this.curNote,
+      modes: this.modes.map((p) => ({ midi: p.midi, amp: Math.round(p.amp * 100) / 100 })),
+    };
   }
 
   private setPlate(prog: Program) {

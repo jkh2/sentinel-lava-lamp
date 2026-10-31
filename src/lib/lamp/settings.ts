@@ -21,6 +21,8 @@ export interface LampSettings {
   pulse: number;
   /** How readily a sound counts as a beat (higher hears more beats). */
   sensitivity: number;
+  /** How quickly the old note's figure gives way when the note changes. */
+  snap: number;
   palette: PaletteId;
   volume: number;
   paused: boolean;
@@ -42,6 +44,7 @@ export const DEFAULT_SETTINGS: LampSettings = {
   beats: 0.65,
   pulse: 0.55,
   sensitivity: 0.5,
+  snap: 0.65,
   palette: "amber",
   volume: 0.84,
   paused: false,

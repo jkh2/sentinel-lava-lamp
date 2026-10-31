@@ -70,6 +70,7 @@ export function LampExperience() {
         __lampNote?: () => { midi: number; strength: number; onsets: number; bass: number; mid: number };
       };
       w.__lampAdvance = (s) => engine.advance(s);
+      (w as unknown as { __lampPlate?: () => unknown }).__lampPlate = () => engine.plateState();
       w.__lampTrackTime = () => (rig.audio.paused ? -1 : rig.audio.currentTime);
       w.__lampNote = () => ({ midi: rig.noteMidi, strength: rig.noteStrength, onsets: rig.onsets, bass: rig.bass, mid: rig.mid });
       w.__lampSeek = (t) => {
@@ -104,6 +105,7 @@ export function LampExperience() {
       p.lead = current.lead;
       p.beats = current.beats;
       p.pulse = current.pulse;
+      p.snap = current.snap;
       p.paused = current.paused;
       p.palette = palette;
       rig.sensitivity = current.sensitivity;
