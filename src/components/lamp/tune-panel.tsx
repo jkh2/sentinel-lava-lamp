@@ -153,6 +153,28 @@ export function TunePanel({
         high="resonant"
         onChange={(cymatics) => onChange({ cymatics })}
       />
+      <div className="tune-actions" role="radiogroup" aria-label="Cymatics medium">
+        <button
+          type="button"
+          className="btn grow"
+          role="radio"
+          aria-checked={settings.plate !== "square"}
+          data-on={settings.plate !== "square"}
+          onClick={() => onChange({ plate: "water" })}
+        >
+          Water dish
+        </button>
+        <button
+          type="button"
+          className="btn grow"
+          role="radio"
+          aria-checked={settings.plate === "square"}
+          data-on={settings.plate === "square"}
+          onClick={() => onChange({ plate: "square" })}
+        >
+          Square plate
+        </button>
+      </div>
       <Slider
         label="Pattern change"
         value={settings.snap}

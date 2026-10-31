@@ -44,9 +44,23 @@ uniform vec4 uModes[3]; // n, m, signed amplitude, rotation
 uniform vec3 uPlate;    // centre uv, radius in screen heights
 uniform float uSpread;  // plate radii before the figure fades out
 uniform float uCym;     // overall strength (slider)
+uniform float uWater;   // 0 = square Chladni plate, 1 = round water dish (CymaScope-like)
 float chladni(vec2 q, float n, float m, float s) {
   const float PI = 3.14159265;
   return cos(n * PI * q.x) * cos(m * PI * q.y) + s * cos(m * PI * q.x) * cos(n * PI * q.y);
+}
+// A standing wave on a round water surface, as photographed in CymaScope
+// images: a star of "folds" points at the centre, "rings" concentric rings,
+// and an outer band where the petals double. The extra ring term bends the
+// spokes into closed petals, so the nodal lines read as a mandala.
+float waterDish(vec2 q, float folds, float rings, float s) {
+  const float PI = 3.14159265;
+  float r = length(q);
+  float th = atan(q.y, q.x);
+  float outer = smoothstep(0.42, 0.78, r);
+  float angular = mix(cos(folds * th), cos(2.0 * folds * th), outer);
+  float radial = cos(rings * PI * r);
+  return radial * angular + s * 0.55 * cos((rings + 0.5) * PI * r);
 }
 float plateField(vec2 uv, out float mask, out float energy) {
   vec2 d = uv - uPlate.xy;
@@ -61,7 +75,8 @@ float plateField(vec2 uv, out float mask, out float energy) {
     if (M.z == 0.0) continue;
     float c = cos(M.w), s = sin(M.w);
     vec2 q = vec2(c * q0.x - s * q0.y, s * q0.x + c * q0.y);
-    phi += abs(M.z) * chladni(q, M.x, M.y, sign(M.z));
+    float f = uWater > 0.5 ? waterDish(q, M.x, M.y, sign(M.z)) : chladni(q, M.x, M.y, sign(M.z));
+    phi += abs(M.z) * f;
     energy += abs(M.z);
   }
   return phi;
